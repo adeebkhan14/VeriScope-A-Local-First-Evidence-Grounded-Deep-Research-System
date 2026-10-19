@@ -24,6 +24,12 @@ Research Pipeline
    └── Ollama + Mistral → grounded answer
 ```
 
+Completed research results are stored in the browser's local IndexedDB
+database. The research library supports full-text search over saved
+questions and answers, saved-result filtering, reopening, copying answer
+text, deleting individual entries, and clearing the local library. This
+browser storage is not sent to the backend or synchronized across devices.
+
 ------------------------------------------------------------------------
 
 # 1. Prerequisites
@@ -519,6 +525,16 @@ curl -X POST http://localhost:5001/api/search \
   -H "Content-Type: application/json" \
   -d '{"query":"How does Kubernetes perform service discovery?"}'
 ```
+
+The `query` field must be a non-empty string. `forceWebSearch`, when
+provided, must be a boolean. Invalid fields and malformed JSON return a
+JSON `400` response with a message describing the problem.
+
+If SearXNG is unavailable, the API returns `503`; invalid or failed
+upstream responses return `502`. Unexpected server errors return `500`
+with a generic client-safe message. Individual page scrape failures do
+not stop the rest of the search: available snippets and successfully
+scraped pages are used, and recovery details are returned in `warnings`.
 
 The pipeline should execute:
 
