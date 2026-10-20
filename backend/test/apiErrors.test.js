@@ -181,7 +181,7 @@ describe("Research recovery from scraper failures", () => {
     });
 
     assert.equal(result.searchedWeb, true);
-    assert.equal(result.answeredByLLM, true);
+    assert.equal(result.answeredByLLM, false);
     assert.ok(result.citations.length > 0);
     assert.ok(
       result.warnings.some((warning) =>

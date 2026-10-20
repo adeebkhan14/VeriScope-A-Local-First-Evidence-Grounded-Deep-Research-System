@@ -108,6 +108,8 @@ describe("Evidence Sufficiency Gate & Grounding Verification", () => {
     assert.strictEqual(generatorCalled, true, "Generator should have been called when evidence is sufficient");
     assert.strictEqual(pipelineResult.insufficientEvidence, false);
     assert.strictEqual(pipelineResult.evidenceStatus, "sufficient");
+    assert.strictEqual(pipelineResult.searchedWeb, true);
+    assert.strictEqual(pipelineResult.answeredByLLM, false);
     assert.ok(pipelineResult.answer.includes("port 5001"));
     assert.ok(pipelineResult.answer.includes("[Source 1]"));
   });

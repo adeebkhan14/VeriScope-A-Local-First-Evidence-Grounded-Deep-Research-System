@@ -259,6 +259,7 @@ function App() {
   const [historyError, setHistoryError] = useState('')
   const [currentResultId, setCurrentResultId] = useState(null)
   const [copyStatus, setCopyStatus] = useState('')
+  const isDirectAnswer = answeredByLLM && !_searchedWeb
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
@@ -707,10 +708,10 @@ function App() {
                     <span className="history-entry-meta">
                       <time dateTime={entry.createdAt}>{formatResearchDate(entry.createdAt)}</time>
                       {entry.saved && <span className="history-saved-badge">Saved</span>}
-                      {entry.evidenceStatus === 'sufficient' && !entry.answeredByLLM && (
+                      {entry.evidenceStatus === 'sufficient' && (!entry.answeredByLLM || entry.searchedWeb) && (
                         <span className="history-verified-badge">Evidence verified</span>
                       )}
-                      {entry.answeredByLLM && <span className="history-local-badge">Local answer</span>}
+                      {entry.answeredByLLM && !entry.searchedWeb && <span className="history-local-badge">Local answer</span>}
                       {entry.insufficientEvidence && <span className="history-evidence-badge">Insufficient evidence</span>}
                       {entry.evidenceStatus === 'verification_failed' && (
                         <span className="history-failed-badge">Verification failed</span>
@@ -760,7 +761,7 @@ function App() {
               <div className="results-kicker">
                 {isLoading
                   ? 'REQUEST IN PROGRESS'
-                  : answeredByLLM
+                  : isDirectAnswer
                   ? 'LOCAL KNOWLEDGE'
                   : insufficientEvidence
                   ? evidenceStatus === 'verification_failed'
@@ -782,7 +783,7 @@ function App() {
                 {citations.length} {citations.length === 1 ? 'source' : 'sources'} reviewed (insufficient)
               </div>
             )}
-            {!isLoading && !error && answeredByLLM && (
+            {!isLoading && !error && isDirectAnswer && (
               <div className="result-count direct-count">
                 <span className="count-light-green" />
                 Direct answer
@@ -830,13 +831,13 @@ function App() {
               <article className="answer-card glass-panel">
                 <div className="answer-header">
                   <div className="answer-label">
-                    <span className={`answer-status-mark ${answeredByLLM ? 'status-mark-local' : insufficientEvidence ? 'status-mark-warning' : 'status-mark-verified'}`} aria-hidden="true" />
+                    <span className={`answer-status-mark ${isDirectAnswer ? 'status-mark-local' : insufficientEvidence ? 'status-mark-warning' : 'status-mark-verified'}`} aria-hidden="true" />
                     <span>
                       {insufficientEvidence
                         ? evidenceStatus === 'verification_failed'
                           ? 'Evidence verification failed'
                           : 'Insufficient evidence'
-                        : answeredByLLM
+                        : isDirectAnswer
                         ? 'Local model answer · not web-verified'
                         : evidenceStatus === 'sufficient'
                         ? 'Evidence verified · grounded in cited sources'
@@ -867,7 +868,7 @@ function App() {
                         {currentResult?.saved ? 'Saved' : 'Save result'}
                       </button>
                     )}
-                    {answeredByLLM && (
+                    {isDirectAnswer && (
                       <button
                         type="button"
                         className="force-web-button"
