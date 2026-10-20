@@ -1,0 +1,103 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      PORT: "5001"
+      SEARXNG_URL: ${DOCKER_SEARXNG_URL:-http://searxng:8080}
+      OLLAMA_URL: ${DOCKER_OLLAMA_URL:-http://host.docker.internal:11434}
+      EMBEDDING_URL: ${DOCKER_EMBEDDING_URL:-http://embedding:8000/embed}
+      EVIDENCE_JUDGE_TIMEOUT_MS: ${EVIDENCE_JUDGE_TIMEOUT_MS:-180000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "5001:5001"
+    depends_on:
+      searxng:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:5001/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    restart: unless-stopped
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set SEARXNG_SECRET in the root .env file}
+      SEARXNG_VALKEY_URL: valkey://valkey:6379/0
+    ports:
+      - "${SEARXNG_HOST_BIND:-127.0.0.1}:${SEARXNG_PORT:-8080}:8080"
+    expose:
+      - "8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    depends_on:
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=5)"
+      interval: 15s
+      timeout: 8s
+      retries: 10
+      start_period: 30s
+
+  valkey:
+    image: docker.io/valkey/valkey:9-alpine
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "300", "1", "--save", "60", "1000", "--loglevel", "warning"]
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  embedding:
+    build:
+      context: ./backend/embedding-service
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  searxng-cache:
+  valkey-data:

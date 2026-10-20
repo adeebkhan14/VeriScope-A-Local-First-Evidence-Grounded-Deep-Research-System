@@ -72,7 +72,7 @@ export async function discoverUrls(query) {
       lower.includes("connect")
     ) {
       const serviceError = new Error(
-        `Web discovery service (SearXNG) is not reachable at ${SEARXNG_URL}. Please verify your Docker container is running.`
+        `Web discovery service (SearXNG) is not reachable at ${SEARXNG_URL}. Please verify the SearXNG service is running.`
       );
       serviceError.code = "SERVICE_UNAVAILABLE";
       serviceError.service = "SearXNG";

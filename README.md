@@ -34,216 +34,83 @@ browser storage is not sent to the backend or synchronized across devices.
 
 # 1. Prerequisites
 
-This guide assumes macOS, including Apple Silicon Macs such as
-M1/M2/M3/M4/M5.
+The same Docker Compose project runs on macOS and Windows with Docker
+Desktop. Ollama and Mistral remain native host prerequisites; SearXNG,
+the frontend, backend, and MiniLM run in Compose.
 
 You need:
 
--   macOS
--   Node.js
--   npm
--   Python 3
--   Docker Desktop
--   Git
--   Ollama
+- Docker Desktop
+- Ollama installed on the host
+- The `mistral` model downloaded in Ollama
+- Node.js, npm, and Python 3 only for native/manual development
 
-Check the basic tools:
+For a Docker-only launch, verify Docker Desktop is running:
 
-``` bash
-node --version
-npm --version
-python3 --version
-git --version
+```text
 docker --version
+docker compose version
+docker info
 ```
 
-------------------------------------------------------------------------
+# 2. Project structure
 
-# 2. Project Structure
-
-The project currently looks like:
-
-``` text
-VeriScope/
-├── backend/
-│   ├── embedding-service/
-│   │   ├── app.py
-│   │   ├── requirements.txt
-│   │   └── venv/
-│   │
-│   └── src/
-│       ├── server.js
-│       ├── research.js
-│       ├── testResearch.js
-│       │
-│       ├── routes/
-│       │   └── search.js
-│       │
-│       ├── scraper/
-│       │   ├── searchEngine.js
-│       │   └── scraper.js
-│       │
-│       ├── retrieval/
-│       │   ├── chunker.js
-│       │   ├── bm25.js
-│       │   ├── embeddings.js
-│       │   ├── semanticSearch.js
-│       │   ├── normalize.js
-│       │   └── evidence.js
-│       │
-│       └── llm/
-│           └── mistral.js
-│
-└── frontend/
-    └── ...
-```
-
-If your React folder has a different name, use that directory instead of
-`frontend`.
-
-------------------------------------------------------------------------
+The repository contains the React frontend, Express backend, FastAPI
+embedding service, Compose definition, and project-managed SearXNG
+settings. SearXNG's cache and Valkey state are stored in named Docker
+volumes.
 
 # 3. Install Docker Desktop
 
-Download and install Docker Desktop for Mac.
-
-For Apple Silicon, install the Apple Silicon version.
+Install Docker Desktop for macOS or Windows from the official Docker
+website. On Windows, use the WSL 2 backend if Docker Desktop offers the
+choice.
 
 After installation, open Docker Desktop and wait until Docker is
 running.
 
-Verify:
-
-``` bash
-docker --version
-```
-
-Then:
-
-``` bash
-docker info
-```
-
-If `docker info` prints Docker server information, Docker is working.
-
-You can also check:
-
-``` bash
-docker ps
-```
-
-Docker Desktop is required because SearXNG is running inside a Docker
-container.
-
 ------------------------------------------------------------------------
 
-# 4. Install and Setup SearXNG
+# 4. Configure SearXNG and local environment
 
 SearXNG is used by VeriScope for web search/discovery.
 
 It is NOT the final retrieval system. It gives VeriScope URLs that can
 then be scraped and processed locally.
 
-## 4.1 Create the SearXNG directory
+Copy the sample environment file once.
 
-From your home directory or another location where you keep development
-projects:
+macOS:
 
-``` bash
-mkdir -p ~/veriscope-searxng
-cd ~/veriscope-searxng
-```
-
-Create the configuration directory:
-
-``` bash
-mkdir -p searxng/core-config
-```
-
-Download the official Docker Compose configuration:
-
-``` bash
-curl -fsSL \
-  -O https://raw.githubusercontent.com/searxng/searxng/master/container/docker-compose.yml \
-  -O https://raw.githubusercontent.com/searxng/searxng/master/container/.env.example
-```
-
-Create the environment file:
-
-``` bash
+```sh
 cp .env.example .env
+openssl rand -hex 32
 ```
 
-The official SearXNG documentation recommends Docker Compose for
-container deployment.
+Windows PowerShell:
 
-## 4.2 Start SearXNG
-
-Run:
-
-``` bash
-docker compose up -d
+```powershell
+Copy-Item .env.example .env
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$bytes = New-Object byte[] 32
+$rng.GetBytes($bytes)
+($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
 ```
 
-Check the containers:
+Put the generated value in `.env` as `SEARXNG_SECRET`. Keep `.env`
+private; it is ignored by Git. The checked-in
+[`searxng/settings.yml`](./searxng/settings.yml) preserves the existing
+default SearXNG settings and JSON search format. The secret is supplied at
+runtime, not stored in the settings file or image.
 
-``` bash
-docker compose ps
-```
-
-You should see the SearXNG services running.
-
-Check all Docker containers:
-
-``` bash
-docker ps
-```
-
-## 4.3 Test SearXNG
-
-Open:
-
-``` text
-http://localhost:8080
-```
-
-Or test from the terminal:
-
-``` bash
-curl "http://localhost:8080/search?q=kubernetes&format=json"
-```
-
-If you receive JSON containing search results, SearXNG is working.
-
-## 4.4 Stop SearXNG
-
-When finished:
-
-``` bash
-cd ~/veriscope-searxng
-docker compose down
-```
-
-Start it again later:
-
-``` bash
-cd ~/veriscope-searxng
-docker compose up -d
-```
-
-## 4.5 Check SearXNG logs
-
-If something goes wrong:
-
-``` bash
-docker compose logs -f
-```
-
-Or:
-
-``` bash
-docker compose logs -f core
-```
+The previous separate SearXNG project is not modified or removed by this
+migration. VeriScope now has its own managed SearXNG configuration and
+persistent cache/Valkey volumes. If the old service is still using port
+8080, either stop it yourself when convenient or change `SEARXNG_PORT` in
+`.env` (for example, to `8081`). For native backend development, also set
+`SEARXNG_URL=http://localhost:8081` in `.env`. Compose backend traffic
+continues to use the internal `searxng:8080` address. The old project
+remains available independently.
 
 ------------------------------------------------------------------------
 
@@ -251,7 +118,9 @@ docker compose logs -f core
 
 Ollama runs the local language model used by VeriScope.
 
-Install Ollama for macOS.
+Install Ollama for macOS or Windows from the official Ollama download
+page. Keep Ollama running on the host; it is deliberately not
+containerized.
 
 After installation, check:
 
@@ -277,240 +146,86 @@ Download/run it:
 ollama run mistral
 ```
 
-The first run downloads the model.
-
-After it finishes downloading, you can exit the interactive model with:
-
-``` text
-/bye
-```
-
-Verify:
+The first run downloads the model. Verify it is installed:
 
 ``` bash
 ollama list
 ```
 
-You should see something similar to:
+------------------------------------------------------------------------
 
-``` text
-mistral
-```
+# 7. Ollama connectivity
 
-The current Ollama Mistral model is a 7B model and the default model is
-roughly 4.4 GB.
+Native backend development uses `http://localhost:11434`. A containerized
+backend uses `http://host.docker.internal:11434`, which Docker Desktop
+resolves to the host on both macOS and Windows.
+
+If `/api/tags` works on the host but the backend container cannot connect,
+the Ollama listener may be bound only to loopback. Restart Ollama with
+`OLLAMA_HOST=0.0.0.0:11434` (macOS: `OLLAMA_HOST=0.0.0.0:11434 ollama
+serve`; Windows PowerShell: `$env:OLLAMA_HOST='0.0.0.0:11434'; ollama
+serve`). This listens on all interfaces, so only do this with the host
+firewall restricting inbound access to local Docker/host traffic. Do not
+create a public or LAN-wide inbound rule, configure router port
+forwarding, or expose Ollama to the internet. Verify host firewall and
+Docker Desktop networking before changing the listener.
 
 ------------------------------------------------------------------------
 
-# 7. Ollama Server
+# 8. Native/manual development prerequisites
 
-Ollama normally exposes its local API on:
+The Compose startup does not require local Node.js or Python. For the
+native workflow, install project dependencies once:
 
-``` text
-http://localhost:11434
+```sh
+cd backend
+npm ci
+cd ../frontend
+npm ci
 ```
-
-Check whether Ollama is already running:
-
-``` bash
-lsof -i :11434
-```
-
-If you see:
-
-``` text
-ollama ... TCP localhost:11434 (LISTEN)
-```
-
-the Ollama server is already running.
-
-You do NOT need to run another `ollama serve`.
-
-If Ollama is not running, start it:
-
-``` bash
-ollama serve
-```
-
-You can also test the model directly:
-
-``` bash
-ollama run mistral
-```
-
-------------------------------------------------------------------------
-
-# 8. Install Backend Dependencies
-
-Go to the backend:
-
-``` bash
-cd ~/path/to/VeriScope/backend
-```
-
-If you have not initialized npm yet:
-
-``` bash
-npm init -y
-```
-
-Install Express and CORS:
-
-``` bash
-npm install express cors
-```
-
-Install Axios and Cheerio:
-
-``` bash
-npm install axios cheerio
-```
-
-Install Playwright:
-
-``` bash
-npm install playwright
-```
-
-Install Chromium for Playwright:
-
-``` bash
-npx playwright install chromium
-```
-
-Install BM25:
-
-``` bash
-npm install wink-bm25-text-search
-```
-
-Install the Ollama JavaScript client:
-
-``` bash
-npm install ollama
-```
-
-Your backend dependencies should now include the packages required by
-the current pipeline.
 
 ------------------------------------------------------------------------
 
 # 9. Setup the Local MiniLM Embedding Service
 
-VeriScope uses:
+For manual development, start MiniLM in its own terminal. From the
+repository root on macOS:
 
-``` text
-all-MiniLM-L6-v2
-```
-
-for local semantic embeddings.
-
-Go to:
-
-``` bash
-cd ~/path/to/VeriScope/backend/embedding-service
-```
-
-Create a Python virtual environment:
-
-``` bash
-python3 -m venv venv
-```
-
-Activate it:
-
-``` bash
-source venv/bin/activate
-```
-
-Install dependencies:
-
-``` bash
-pip install -r requirements.txt
-```
-
-The `requirements.txt` should contain:
-
-``` text
-fastapi
-uvicorn
-sentence-transformers
-```
-
-Start the embedding API:
-
-``` bash
+```sh
+python3 -m venv backend/embedding-service/venv
+source backend/embedding-service/venv/bin/activate
+pip install -r backend/embedding-service/requirements.txt
+cd backend/embedding-service
 uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
-The service should now be available at:
+On Windows PowerShell:
 
-``` text
-http://127.0.0.1:8000
-```
-
-Test it:
-
-``` bash
-curl http://127.0.0.1:8000/
-```
-
-Expected response:
-
-``` json
-{
-  "status": "Embedding service running"
-}
-```
-
-Keep this terminal running while using VeriScope.
-
-To stop it:
-
-``` text
-CTRL + C
+```powershell
+py -3 -m venv backend\embedding-service\venv
+.\backend\embedding-service\venv\Scripts\Activate.ps1
+python -m pip install -r backend\embedding-service\requirements.txt
+Set-Location backend\embedding-service
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
 ------------------------------------------------------------------------
 
 # 10. Start the VeriScope Backend
 
-Open a new terminal.
+Start Ollama and MiniLM, then start the Compose-managed SearXNG service
+from the repository root with `docker compose up -d searxng`. Keep `.env`
+in the repository root, then start the backend from `backend/` so Node loads the native
+service URLs from that file:
 
-Go to the backend directory:
-
-``` bash
-cd ~/path/to/VeriScope/backend
+```sh
+cd backend
+node --env-file=../.env src/server.js
 ```
 
-Start Express:
-
-``` bash
-node src/server.js
-```
-
-The backend runs on:
-
-``` text
-http://localhost:5001
-```
-
-Test it:
-
-``` bash
-curl http://localhost:5001/
-```
-
-Expected response:
-
-``` json
-{
-  "name": "VeriScope API",
-  "status": "running"
-}
-```
-
-Keep this terminal running.
+Without `.env`, native defaults use SearXNG at `http://localhost:8080`,
+Ollama at `http://localhost:11434`, and MiniLM at
+`http://127.0.0.1:8000`.
 
 ------------------------------------------------------------------------
 
@@ -518,12 +233,18 @@ Keep this terminal running.
 
 You can test the complete research pipeline without React.
 
-From another terminal:
+From another terminal on macOS:
 
-``` bash
+```sh
 curl -X POST http://localhost:5001/api/search \
   -H "Content-Type: application/json" \
   -d '{"query":"How does Kubernetes perform service discovery?"}'
+```
+
+On Windows PowerShell:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:5001/api/search -ContentType 'application/json' -Body '{"query":"How does Kubernetes perform service discovery?"}'
 ```
 
 The `query` field must be a non-empty string. `forceWebSearch`, when
@@ -568,23 +289,10 @@ Answer + citations
 
 # 12. Start React
 
-Open another terminal.
+In another terminal:
 
-Go to your React directory:
-
-``` bash
-cd ~/path/to/VeriScope/frontend
-```
-
-Install dependencies if necessary:
-
-``` bash
-npm install
-```
-
-Start Vite:
-
-``` bash
+```sh
+cd frontend
 npm run dev
 ```
 
@@ -598,68 +306,28 @@ Open that address in your browser.
 
 ------------------------------------------------------------------------
 
-# 13. Complete Startup Order
+# 13. Run VeriScope with Docker Compose
 
-For normal development, you need these services:
+After completing section 4 and setting `SEARXNG_SECRET`, the single
+startup command builds and starts the frontend, backend, MiniLM, SearXNG,
+and Valkey:
 
-``` text
-┌─────────────────────────────┐
-│ Docker                      │
-│ SearXNG :8080               │
-└──────────────┬──────────────┘
-               ↓
-┌─────────────────────────────┐
-│ Ollama                      │
-│ Mistral :11434              │
-└──────────────┬──────────────┘
-               ↓
-┌─────────────────────────────┐
-│ MiniLM Embedding API        │
-│ :8000                       │
-└──────────────┬──────────────┘
-               ↓
-┌─────────────────────────────┐
-│ Express Backend             │
-│ :5001                       │
-└──────────────┬──────────────┘
-               ↓
-┌─────────────────────────────┐
-│ React                       │
-│ :5173                       │
-└─────────────────────────────┘
+```text
+docker compose up --build
 ```
 
-## Terminal 1 --- SearXNG
+Open **http://localhost:5173**. The backend API is available at
+**http://localhost:5001**. Ollama and Mistral remain native host services.
+The backend waits for healthy SearXNG and MiniLM services before starting.
 
-``` bash
-cd ~/veriscope-searxng
-docker compose up -d
-```
-
-## Terminal 2 --- MiniLM
-
-``` bash
-cd ~/path/to/VeriScope/backend/embedding-service
-source venv/bin/activate
-uvicorn app:app --host 127.0.0.1 --port 8000
-```
-
-## Terminal 3 --- Backend
-
-``` bash
-cd ~/path/to/VeriScope/backend
-node src/server.js
-```
-
-## Terminal 4 --- React
-
-``` bash
-cd ~/path/to/VeriScope/frontend
-npm run dev
-```
-
-Ollama normally runs as a background service, so you generally don't
-need a separate terminal for it.
+| Service | Host address | Notes |
+| --- | --- | --- |
+| Frontend | `http://localhost:5173` | React/Vite app served by the frontend container |
+| Backend | `http://localhost:5001` | Express API |
+| SearXNG | `http://localhost:8080` | Host port configurable with `SEARXNG_PORT`; internal address is `searxng:8080` |
+| MiniLM | `embedding:8000` | Compose-only; native development uses `http://127.0.0.1:8000` |
+| Ollama | `http://localhost:11434` | Native host service; containers reach `host.docker.internal:11434` |
+| Valkey | `valkey:6379` | Internal SearXNG state; not published to the host |
 
 ------------------------------------------------------------------------
 
@@ -675,14 +343,30 @@ docker ps
 
 ### SearXNG
 
-``` bash
+macOS:
+
+```sh
 curl "http://localhost:8080/search?q=test&format=json"
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-RestMethod "http://localhost:8080/search?q=test&format=json"
 ```
 
 ### Ollama
 
-``` bash
-lsof -i :11434
+macOS:
+
+```sh
+curl http://localhost:11434/api/tags
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-RestMethod http://localhost:11434/api/tags
 ```
 
 ### Mistral
@@ -694,13 +378,32 @@ ollama list
 ### MiniLM
 
 ``` bash
-curl http://127.0.0.1:8000/
+docker compose exec backend node -e "fetch('http://embedding:8000/').then(async r => { console.log(await r.text()); process.exit(r.ok ? 0 : 1); })"
 ```
+
+Check the backend's Compose-network connections to its dependencies:
+
+```sh
+docker compose exec backend node -e "fetch('http://searxng:8080/search?q=test&format=json').then(r => { console.log('SearXNG HTTP ' + r.status); process.exit(r.ok ? 0 : 1); })"
+docker compose exec backend node -e "fetch('http://embedding:8000/').then(async r => { console.log(await r.text()); process.exit(r.ok ? 0 : 1); })"
+docker compose exec backend node -e "fetch('http://host.docker.internal:11434/api/tags').then(r => { console.log('Ollama HTTP ' + r.status); process.exit(r.ok ? 0 : 1); })"
+```
+
+The `/api/health` endpoint reports connectivity status for all three
+upstream services.
 
 ### Backend
 
-``` bash
+macOS:
+
+```sh
 curl http://localhost:5001/
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-RestMethod http://localhost:5001/
 ```
 
 ### React
@@ -713,50 +416,52 @@ http://localhost:5173
 
 ------------------------------------------------------------------------
 
-# 15. Stopping Everything
+# 15. Stopping Services
 
-## Stop React
+Stop the Compose stack while preserving named data volumes:
 
-In the React terminal:
-
-``` text
-CTRL + C
-```
-
-## Stop Backend
-
-In the backend terminal:
-
-``` text
-CTRL + C
-```
-
-## Stop MiniLM
-
-In the embedding-service terminal:
-
-``` text
-CTRL + C
-```
-
-## Stop SearXNG
-
-``` bash
-cd ~/veriscope-searxng
+```text
 docker compose down
 ```
 
-## Stop Ollama
-
-You normally don't need to stop Ollama.
-
-If you want to stop it:
-
-``` bash
-pkill -f ollama
-```
+This does not stop native Ollama. The previous separate SearXNG project
+is untouched.
 
 ------------------------------------------------------------------------
+
+## Troubleshooting: macOS
+
+- If `docker info` cannot connect, open Docker Desktop and wait for its
+  engine to finish starting. `docker compose ps` should show healthy
+  services after startup.
+- Check host ports with `lsof -nP -iTCP:8080 -sTCP:LISTEN` and the same
+  command for `5173`, `5001`, and `11434`. If another local SearXNG owns
+  8080, change `SEARXNG_PORT` in `.env`; Compose-to-Compose traffic still
+  uses `searxng:8080`.
+- Test host Ollama with `curl http://localhost:11434/api/tags`. If that
+  works but the container check fails, see the host-listener and firewall
+  instructions in section 7.
+- Inspect service startup with `docker compose ps` and
+  `docker compose logs searxng valkey backend embedding`.
+
+## Troubleshooting: Windows
+
+- Start Docker Desktop and confirm its WSL 2 backend is running before
+  using `docker compose`. In PowerShell, `docker info` must show server
+  details.
+- Check port conflicts with
+  `Get-NetTCPConnection -State Listen -LocalPort 8080,5173,5001,11434`.
+  Change `SEARXNG_PORT` in `.env` if local port 8080 is occupied.
+- Test host Ollama with
+  `Invoke-RestMethod http://localhost:11434/api/tags`. If Compose cannot
+  reach it, confirm Windows Defender Firewall permits local Docker
+  Desktop traffic to port 11434; do not create a public inbound rule.
+- From the backend container, run the `host.docker.internal` check in
+  section 14. For SearXNG and MiniLM use their Compose service names;
+  `localhost` inside a container refers to that container itself.
+- Use `docker compose logs searxng valkey backend embedding` to inspect
+  startup failures. The first MiniLM start downloads model weights and
+  may take several minutes.
 
 # 16. Important: Why Does Research Take \~3 Minutes?
 
@@ -945,38 +650,39 @@ goals.
 
 # 20. Useful Commands Cheat Sheet
 
-### SearXNG
+### Compose stack (all app services and SearXNG)
 
 ``` bash
-cd ~/veriscope-searxng
-docker compose up -d
-docker compose ps
-docker compose logs -f
+docker compose up --build
 docker compose down
 ```
+
+For native/manual development, start only the Compose-managed search
+services with `docker compose up -d searxng`.
+
+To check persistence across a restart, use `docker compose down`, then
+`docker compose up --build` and repeat the search test. Do not use
+`docker compose down -v` unless you intend to delete named state volumes.
 
 ### Ollama
 
 ``` bash
 ollama list
 ollama run mistral
-lsof -i :11434
 ollama serve
 ```
 
 ### MiniLM
 
 ``` bash
-cd backend/embedding-service
-source venv/bin/activate
-uvicorn app:app --host 127.0.0.1 --port 8000
+docker compose exec backend node -e "fetch('http://embedding:8000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 ```
 
 ### Backend
 
 ``` bash
 cd backend
-node src/server.js
+node --env-file=../.env src/server.js
 ```
 
 ### React
@@ -986,13 +692,8 @@ cd frontend
 npm run dev
 ```
 
-### Complete API test
-
-``` bash
-curl -X POST http://localhost:5001/api/search \
-  -H "Content-Type: application/json" \
-  -d '{"query":"How does Kubernetes perform service discovery?"}'
-```
+For the complete API research test, use the macOS or PowerShell command
+in section 11.
 
 ------------------------------------------------------------------------
 
@@ -1001,7 +702,7 @@ curl -X POST http://localhost:5001/api/search \
 For installation details and updates, use the official documentation
 for:
 
--   Docker Desktop for Mac
+-   Docker Desktop for macOS and Windows
 -   SearXNG container installation
 -   Ollama
 -   Ollama Mistral model

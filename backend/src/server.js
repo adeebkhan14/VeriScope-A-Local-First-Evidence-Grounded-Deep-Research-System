@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createSearchRouter } from "./routes/search.js";
+import { OLLAMA_URL } from "./llm/ollamaClient.js";
 
 export function createApp({ researchFn } = {}) {
   const app = express();
@@ -33,8 +34,7 @@ export function createApp({ researchFn } = {}) {
     };
 
     const searxngUrl = process.env.SEARXNG_URL || "http://localhost:8080";
-    const ollamaUrl =
-      process.env.OLLAMA_URL || "http://localhost:11434/api/tags";
+    const ollamaUrl = `${OLLAMA_URL}/api/tags`;
     const embeddingBaseUrl = process.env.EMBEDDING_URL
       ? process.env.EMBEDDING_URL.replace(/\/embed\/?$/, "")
       : "http://127.0.0.1:8000";
@@ -49,7 +49,7 @@ export function createApp({ researchFn } = {}) {
       status: "running",
       services: {
         searxng: { ...searxng, url: searxngUrl },
-        ollama: { ...ollama, url: "http://localhost:11434" },
+        ollama: { ...ollama, url: OLLAMA_URL },
         embedding: { ...embedding, url: embeddingBaseUrl },
       },
     });

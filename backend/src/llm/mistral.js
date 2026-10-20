@@ -1,4 +1,4 @@
-import ollama from "ollama";
+import ollama, { OLLAMA_URL } from "./ollamaClient.js";
 
 function normalizeContent(value) {
   if (typeof value === "string") return value;
@@ -227,7 +227,7 @@ ${evidenceText}
     ) {
       return {
         answer:
-          "The local Ollama service is not running on http://localhost:11434. The relevant sources and evidence passages were retrieved and are shown below. Run 'ollama serve' in your terminal to enable local AI synthesis.",
+          `The local Ollama service is not running at ${OLLAMA_URL}. The relevant sources and evidence passages were retrieved and are shown below. Run 'ollama serve' in your terminal to enable local AI synthesis.`,
         isInsufficientEvidence: true,
         llmUnavailable: true,
         citedSourceIds: [],

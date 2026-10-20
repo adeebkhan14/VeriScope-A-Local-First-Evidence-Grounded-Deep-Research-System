@@ -1,4 +1,4 @@
-import ollama from "ollama";
+import ollama, { OLLAMA_URL } from "./ollamaClient.js";
 
 /**
  * Builds the strict evidence-sufficiency prompt for Mistral.
@@ -268,7 +268,7 @@ export async function evaluateEvidenceSufficiency(query, evidence, options = {})
     let missing = "Evidence sufficiency could not be established due to an evaluator error.";
 
     if (isConnRefused) {
-      reason = "Local Ollama service is not running on http://localhost:11434.";
+      reason = `Local Ollama service is not running at ${OLLAMA_URL}.`;
       missing = "Ollama is offline. Start it by running 'ollama serve' in your terminal.";
     } else if (isTimeout) {
       reason = `Evidence evaluator timed out after ${timeoutMs}ms.`;

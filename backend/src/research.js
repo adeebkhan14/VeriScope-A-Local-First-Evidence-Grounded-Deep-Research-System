@@ -472,7 +472,7 @@ export async function research(query, options = {}) {
       ? "Generation detected remaining gaps in retrieved sources."
       : null,
     source: "web_search",
-    answeredByLLM: false,
+    answeredByLLM: !generation.llmUnavailable,
     searchedWeb: true,
     warnings: warnings.length > 0 ? warnings : undefined,
   };

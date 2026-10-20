@@ -31,5 +31,18 @@ frontend/dist-ssr/
 
 # Environment variables
 .env
-.env.local
+.env.*
+!.env.example
 *.local
+
+# Credentials and generated local data
+.secrets/
+credentials/
+**/.cache/
+**/cache/
+**/models/
+*.safetensors
+*.gguf
+searxng/data/
+**/coverage/
+**/test-results/
