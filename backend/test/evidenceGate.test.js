@@ -9,7 +9,9 @@ import {
 import {
   validateAndSanitizeCitations,
   generateAnswer,
-} from "../src/llm/mistral.js";
+  tryDirectAnswer,
+} from "../src/llm/ollama.js";
+import { OLLAMA_MODEL } from "../src/llm/ollamaClient.js";
 import { research } from "../src/research.js";
 
 describe("Evidence Sufficiency Gate & Grounding Verification", () => {
@@ -27,6 +29,102 @@ describe("Evidence Sufficiency Gate & Grounding Verification", () => {
   const mockEmbeddings = async () => ({
     embeddings: null,
     available: false,
+  });
+
+  it("uses the configured Ollama model for judging, grounded answers, and direct answers", async () => {
+    const models = [];
+    const thinkingSettings = [];
+    const mockOllama = createMockOllama(async (params) => {
+      models.push(params.model);
+      thinkingSettings.push(params.think);
+      if (params.format === "json") {
+        return {
+          message: {
+            content: JSON.stringify({
+              sufficient: true,
+              reason: "The evidence answers the query.",
+              missing: null,
+            }),
+          },
+        };
+      }
+      if (params.options.num_predict === 350) {
+        return { message: { content: "Grounded response [Source 1]." } };
+      }
+      return { message: { content: "A direct response." } };
+    });
+    const evidence = [{ id: 1, title: "Source", url: "https://example.com", text: "Evidence." }];
+
+    await evaluateEvidenceSufficiency("Question?", evidence, { ollamaClient: mockOllama });
+    await generateAnswer("Question?", evidence, { ollamaClient: mockOllama });
+    await tryDirectAnswer("Question?", { ollamaClient: mockOllama });
+
+    assert.strictEqual(OLLAMA_MODEL, process.env.OLLAMA_MODEL || "qwen3.5:9b");
+    assert.deepStrictEqual(models, [OLLAMA_MODEL, OLLAMA_MODEL, OLLAMA_MODEL]);
+    assert.deepStrictEqual(thinkingSettings, [false, false, false]);
+  });
+
+  it("streams Ollama answer chunks and validates citations after generation", async () => {
+    const streamed = [];
+    const ollamaClient = {
+      chat: async (params) => {
+        assert.equal(params.stream, true);
+        return (async function* () {
+          yield { message: { content: "Grounded " } };
+          yield { message: { content: "answer [Source 1]." } };
+        })();
+      },
+    };
+
+    const result = await generateAnswer(
+      "Question?",
+      [{ id: 1, title: "Source", url: "https://example.com", text: "Evidence." }],
+      {
+        ollamaClient,
+        onToken: (token) => streamed.push(token),
+      }
+    );
+
+    assert.deepEqual(streamed, ["Grounded ", "answer [Source 1]."]);
+    assert.equal(result.answer, "Grounded answer [Source 1].");
+    assert.deepEqual(result.citedSourceIds, [1]);
+  });
+
+  it("streams direct answers but keeps SEARCH_REQUIRED decision text out of the answer", async () => {
+    const streamed = [];
+    const ollamaClient = {
+      chat: async () => (async function* () {
+        yield { message: { content: "SEARCH_" } };
+        yield { message: { content: "REQUIRED: current information is needed" } };
+      })(),
+    };
+
+    const result = await tryDirectAnswer("What is happening today?", {
+      ollamaClient,
+      onToken: (token) => streamed.push(token),
+    });
+
+    assert.equal(result.canAnswer, false);
+    assert.deepEqual(streamed, []);
+  });
+
+  it("emits local-answer tokens as they arrive", async () => {
+    const streamed = [];
+    const ollamaClient = {
+      chat: async () => (async function* () {
+        yield { message: { content: "A direct " } };
+        yield { message: { content: "response." } };
+      })(),
+    };
+
+    const result = await tryDirectAnswer("Explain this concept", {
+      ollamaClient,
+      onToken: (token) => streamed.push(token),
+    });
+
+    assert.equal(result.canAnswer, true);
+    assert.equal(result.answer, "A direct response.");
+    assert.deepEqual(streamed, ["A direct ", "response."]);
   });
 
   // -------------------------------------------------------------------------
@@ -431,7 +529,7 @@ describe("Evidence Sufficiency Gate & Grounding Verification", () => {
 
       if (prompt.includes("rigorous, factual research assistant")) {
         generatorCalled = true;
-        // Pretrained Mistral would have hallucinated standard folklore ingredients here
+        // A pretrained model could hallucinate standard folklore ingredients here
         return {
           message: {
             content: "The secret recipe is rumored to contain vanilla, cinnamon, and coca leaf extract.",

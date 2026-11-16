@@ -10,17 +10,32 @@ import {
   deduplicateChunks,
   diversifySources,
 } from "./retrieval/deduplicate.js";
-import { generateAnswer, tryDirectAnswer } from "./llm/mistral.js";
+import { generateAnswer, tryDirectAnswer } from "./llm/ollama.js";
 import { evaluateEvidenceSufficiency } from "./llm/evidenceJudge.js";
+import { attributeClaims } from "./llm/evidenceAttribution.js";
+import {
+  buildConversationContext,
+} from "./llm/conversationContext.js";
+import {
+  OLLAMA_CONTEXT_LENGTH,
+  OLLAMA_HISTORY_TOKEN_BUDGET,
+  OLLAMA_NUM_PREDICT,
+} from "./llm/ollamaClient.js";
+import { buildGroundedAnswerPrompt } from "./llm/ollama.js";
+import {
+  estimateEvidenceTokens,
+  estimateTokenCount,
+  normalizeResearchSettings,
+  selectEvidenceWithinBudget,
+} from "./retrieval/depth.js";
 
 const MAX_PAGES_TO_SCRAPE = 5;
 const MAX_PAGE_CHARACTERS = 6000;
 const MAX_EMBEDDING_CANDIDATES = 20;
-const MAX_EVIDENCE_CHUNKS = 5;
 
 /**
  * Main research pipeline:
- * 0. Direct answer evaluation via local Mistral (for non-knowledge-intensive / internal-knowledge queries)
+ * 0. Direct answer evaluation via the local Ollama model (for non-knowledge-intensive / internal-knowledge queries)
  * 1. Web search & URL deduplication via SearXNG (for knowledge-intensive / real-time queries)
  * 2. Parallel scraping with search-snippet fallback for inaccessible pages
  * 3. Text chunking & near-duplicate chunk suppression
@@ -28,7 +43,7 @@ const MAX_EVIDENCE_CHUNKS = 5;
  * 5. MiniLM semantic embeddings with graceful lexical fallback
  * 6. Hybrid scoring & source diversification
  * 7. Evidence packaging with supporting excerpts for every citation
- * 8. Factual synthesis via local Mistral with insufficient-evidence detection
+ * 8. Factual synthesis via the local Ollama model with insufficient-evidence detection
  *
  * @param {string} query
  * @param {{ forceWebSearch?: boolean }} [options]
@@ -36,9 +51,28 @@ const MAX_EVIDENCE_CHUNKS = 5;
  *   query: string,
  *   answer: string,
  *   citations: Array<{id: number, title: string, url: string, snippet: string, score: number}>,
- *   evidence: Array<{id: number, title: string, url: string, text: string, score: number}>,
+ *   evidence: Array<{id: number, chunkId: number|null, title: string, sourceTitle: string|null, url: string, text: string, score: number}>,
+ *   claimAttribution?: {
+ *     status: "available" | "unavailable",
+ *     claims: Array<{
+ *       claimId: string,
+ *       claimText: string,
+ *       status: "direct" | "partial" | "related" | "unsupported",
+ *       evidence: Array<{
+ *         sourceId: number|null,
+ *         title: string|null,
+ *         domain: string|null,
+ *         url: string|null,
+ *         extractedText: string,
+ *         chunkId: number,
+ *         relevanceScore: number|null,
+ *         supportStatus: "direct" | "partial" | "related"
+ *       }>
+ *     }>
+ *   },
  *   insufficientEvidence: boolean,
  *   llmUnavailable?: boolean,
+ *   llmError?: { status: string, code: string, message: string },
  *   source?: "local_llm" | "web_search",
  *   answeredByLLM?: boolean,
  *   searchedWeb?: boolean,
@@ -70,8 +104,61 @@ export async function research(query, options = {}) {
     discoverFn = discoverUrls,
     scrapeFn = scrapePage,
     embeddingsFn = getEmbeddingsSafe,
+    onProgress,
+    onToken,
   } = options;
+  const researchSettings = normalizeResearchSettings({
+    depth: options.depth,
+    alpha: options.alpha,
+  });
+  const conversation = buildConversationContext(options.conversation, {
+    tokenBudget: OLLAMA_HISTORY_TOKEN_BUDGET,
+  });
+  const promptOverheadTokens = estimateTokenCount(
+    buildGroundedAnswerPrompt(query.trim(), [], conversation.prompt)
+  );
+  const effectiveEvidenceTokenBudget = Math.max(
+    0,
+    Math.min(
+      researchSettings.evidenceTokenBudget,
+      OLLAMA_CONTEXT_LENGTH - OLLAMA_NUM_PREDICT - promptOverheadTokens
+    )
+  );
+  const sessionId =
+    typeof options.sessionId === "string" ? options.sessionId : null;
+  const createResearchMetadata = ({
+    retrievedChunkCount = 0,
+    chunksSent = 0,
+    evidenceTokenCount = 0,
+    retrievalTimeMs = null,
+    timeToFirstTokenMs = null,
+    generationTimeMs = null,
+  } = {}) => ({
+    depth: researchSettings.depth,
+    alpha: researchSettings.alpha,
+    topK: researchSettings.topK,
+    evidenceTokenBudget: researchSettings.evidenceTokenBudget,
+    effectiveEvidenceTokenBudget,
+    retrievedChunkCount,
+    chunksSent,
+    evidenceTokenCount,
+    contextLength: OLLAMA_CONTEXT_LENGTH,
+    conversationTokens: conversation.tokenCount,
+    conversationMessages: conversation.messagesIncluded,
+    summarizedConversationMessages: conversation.summarizedMessages,
+    retrievalTimeMs,
+    timeToFirstTokenMs,
+    generationTimeMs,
+  });
+  const reportProgress = (message) => onProgress?.(message);
   const warnings = [];
+
+  if (options.signal?.aborted) {
+    const error = new Error("Research request was cancelled.");
+    error.name = "AbortError";
+    error.code = "ABORT_ERR";
+    throw error;
+  }
 
   console.log("\n========================================");
   console.log("STARTING RESEARCH / QUERY EVALUATION");
@@ -80,19 +167,33 @@ export async function research(query, options = {}) {
   console.log("Query:", query);
 
   // ========================================
-  // 0. DIRECT ANSWER EVALUATION (Local Mistral)
+  // 0. DIRECT ANSWER EVALUATION (Local Ollama model)
   // ========================================
   if (!forceWebSearch) {
-    console.log("\n[0] Checking if local Mistral can answer directly...");
-    const directResult = await tryDirectAnswer(query, { ollamaClient });
+    reportProgress("Checking local model...");
+    console.log("\n[0] Checking if the local model can answer directly...");
+    let directAnswerStarted = false;
+    const directResult = await tryDirectAnswer(query, {
+      ollamaClient,
+      signal: options.signal,
+      conversationContext: conversation.prompt,
+      onToken: (token) => {
+        if (!directAnswerStarted) {
+          reportProgress("Generating answer...");
+          directAnswerStarted = true;
+        }
+        onToken?.(token);
+      },
+    });
 
     if (directResult.canAnswer && directResult.answer) {
       console.log(
-        "✓ Answered directly by local Mistral (internal knowledge / less knowledge-intensive)"
+        "✓ Answered directly by the local model (internal knowledge / less knowledge-intensive)"
       );
       return {
         query,
         answer: directResult.answer,
+        sessionId,
         citations: [],
         evidence: [],
         insufficientEvidence: false,
@@ -100,12 +201,17 @@ export async function research(query, options = {}) {
         source: "local_llm",
         answeredByLLM: true,
         searchedWeb: false,
+        researchMetadata: createResearchMetadata({
+          timeToFirstTokenMs: directResult.timing?.timeToFirstTokenMs ?? null,
+          generationTimeMs: directResult.timing?.generationTimeMs ?? null,
+        }),
       };
     }
 
     if (directResult.llmUnavailable) {
       warnings.push(
-        "Local Ollama service was unavailable for direct evaluation; proceeding with web search."
+        directResult.llmError?.message ||
+          "Ollama could not evaluate a direct answer; proceeding with web search."
       );
     }
 
@@ -121,6 +227,7 @@ export async function research(query, options = {}) {
   // ========================================
   // 1. SEARCH WITH SEARXNG (Deduplicated URLs)
   // ========================================
+  reportProgress("Querying SearXNG...");
   console.log("\n[1] Searching with SearXNG...");
   const searchResults = await discoverFn(query);
   console.log(`Found ${searchResults.length} unique search results`);
@@ -128,6 +235,7 @@ export async function research(query, options = {}) {
   if (searchResults.length === 0) {
     return {
       query,
+      sessionId,
       answer:
         "Not enough evidence. The web search returned 0 results for your query. Try broadening your terms or using different keywords.",
       citations: [],
@@ -145,6 +253,7 @@ export async function research(query, options = {}) {
       answeredByLLM: false,
       searchedWeb: true,
       warnings: ["SearXNG returned no search results."],
+      researchMetadata: createResearchMetadata(),
     };
   }
 
@@ -153,6 +262,7 @@ export async function research(query, options = {}) {
   // ========================================
   console.log("\n[2] Scraping webpages in parallel...");
   const selectedResults = searchResults.slice(0, MAX_PAGES_TO_SCRAPE);
+  reportProgress(`Scraping ${selectedResults.length} pages...`);
 
   const scrapeOutcomes = await Promise.allSettled(
     selectedResults.map(async (result) => {
@@ -215,6 +325,7 @@ export async function research(query, options = {}) {
   if (pages.length === 0) {
     return {
       query,
+      sessionId,
       answer:
         "Not enough evidence. Web search discovered links, but none of the pages were accessible or contained readable text.",
       citations: searchResults.slice(0, 3).map((r, i) => ({
@@ -241,6 +352,7 @@ export async function research(query, options = {}) {
         "All discovered pages were inaccessible.",
         ...warnings,
       ],
+      researchMetadata: createResearchMetadata(),
     };
   }
 
@@ -276,6 +388,7 @@ export async function research(query, options = {}) {
   if (chunks.length === 0) {
     return {
       query,
+      sessionId,
       answer:
         "Not enough evidence. No substantial text chunks could be extracted from the pages.",
       citations: [],
@@ -292,12 +405,14 @@ export async function research(query, options = {}) {
       source: "web_search",
       answeredByLLM: false,
       searchedWeb: true,
+      researchMetadata: createResearchMetadata(),
     };
   }
 
   // ========================================
   // 4. BM25 LEXICAL RETRIEVAL
   // ========================================
+  const retrievalStartedAt = Date.now();
   console.log("\n[4] Building BM25 index & scoring...");
   const bm25Index = createBM25Index(chunks);
   const bm25Results = bm25Index.search(query, chunks.length);
@@ -317,6 +432,7 @@ export async function research(query, options = {}) {
   // ========================================
   // 5. SEMANTIC EMBEDDINGS (With graceful lexical fallback)
   // ========================================
+  reportProgress("Reranking with MiniLM...");
   console.log("\n[5] Embedding candidate chunks...");
   const embeddingResponse = await embeddingsFn([
     query,
@@ -343,9 +459,12 @@ export async function research(query, options = {}) {
 
     candidates.forEach((chunk, index) => {
       chunk.hybridScore =
-        0.5 * normalizedBM25[index] + 0.5 * normalizedSemantic[index];
+        researchSettings.alpha * normalizedBM25[index] +
+        (1 - researchSettings.alpha) * normalizedSemantic[index];
     });
-    console.log(`✓ Ranked ${candidates.length} candidates using hybrid fusion`);
+    console.log(
+      `✓ Ranked ${candidates.length} candidates using hybrid fusion (alpha ${researchSettings.alpha})`
+    );
   } else {
     // Graceful fallback to BM25 lexical score
     candidates.forEach((chunk, index) => {
@@ -373,15 +492,31 @@ export async function research(query, options = {}) {
   const topEvidence = diversifySources(
     nonDuplicateCandidates,
     2,
-    MAX_EVIDENCE_CHUNKS
+    researchSettings.topK
   );
 
-  console.log(`Selected top ${topEvidence.length} evidence passages`);
+  const budgetedEvidence = selectEvidenceWithinBudget(
+    topEvidence,
+    researchSettings.topK,
+    effectiveEvidenceTokenBudget
+  );
+  const evidenceTokenCount = estimateEvidenceTokens(budgetedEvidence);
+  const retrievalTimeMs = Date.now() - retrievalStartedAt;
+
+  console.log(
+    `Selected ${budgetedEvidence.length}/${topEvidence.length} evidence passages within ${effectiveEvidenceTokenBudget} tokens`
+  );
 
   // ========================================
   // 7. BUILD EVIDENCE PACKAGE
   // ========================================
-  const evidencePackage = buildEvidencePackage(query, topEvidence);
+  const evidencePackage = buildEvidencePackage(query, budgetedEvidence);
+  const researchMetadata = createResearchMetadata({
+    retrievedChunkCount: rankedCandidates.length,
+    chunksSent: evidencePackage.evidence.length,
+    evidenceTokenCount,
+    retrievalTimeMs,
+  });
 
   // Format citations with supporting text snippets
   const citations = evidencePackage.evidence.map((source) => ({
@@ -395,13 +530,14 @@ export async function research(query, options = {}) {
   // ========================================
   // 8. EVALUATE EVIDENCE SUFFICIENCY (Evidence Gate)
   // ========================================
-  console.log("\n[7] Evaluating evidence sufficiency with local Mistral...");
+  console.log("\n[7] Evaluating evidence sufficiency with the local model...");
   const evaluation = await evaluateEvidenceSufficiency(
     evidencePackage.query,
     evidencePackage.evidence,
     {
       ollamaClient,
       timeoutMs: judgeTimeoutMs,
+      signal: options.signal,
     }
   );
 
@@ -421,6 +557,7 @@ export async function research(query, options = {}) {
 
     return {
       query,
+      sessionId,
       answer: isVerificationFailed
         ? "Not enough evidence. Evidence verification could not be completed at this time."
         : `Not enough evidence. ${reasonText}${missingDetail ? ` ${missingDetail}` : ""}`,
@@ -433,12 +570,15 @@ export async function research(query, options = {}) {
         reason: evaluation.reason,
         missing: evaluation.missing,
         status: evaluation.status,
+        llmError: evaluation.llmError,
       },
+      llmError: evaluation.llmError,
       missingEvidence: evaluation.missing || evaluation.reason,
       source: "web_search",
       answeredByLLM: false,
       searchedWeb: true,
       warnings: warnings.length > 0 ? warnings : undefined,
+      researchMetadata,
     };
   }
 
@@ -446,21 +586,46 @@ export async function research(query, options = {}) {
   // 9. GENERATE GROUNDED ANSWER (Only when evidence is sufficient)
   // ========================================
   console.log(
-    "\n[8] Evidence is sufficient! Generating grounded answer with Mistral..."
+    "\n[8] Evidence is sufficient! Generating grounded answer with the local model..."
   );
+  reportProgress("Generating answer...");
   const generation = await generateAnswer(
     evidencePackage.query,
     evidencePackage.evidence,
-    { ollamaClient }
+    {
+      ollamaClient,
+      onToken,
+      signal: options.signal,
+      conversationContext: conversation.prompt,
+    }
   );
+
+  let claimAttribution;
+  const resultWarnings = [...warnings];
+  if (!generation.llmUnavailable && !generation.isInsufficientEvidence) {
+    reportProgress("Mapping claims to evidence...");
+    claimAttribution = await attributeClaims(
+      generation.answer,
+      evidencePackage.evidence,
+      { ollamaClient, signal: options.signal }
+    );
+    if (claimAttribution.status === "unavailable") {
+      resultWarnings.push(
+        "Claim-level evidence attribution was unavailable; the answer and source citations are unchanged."
+      );
+    }
+  }
 
   return {
     query,
+    sessionId,
     answer: generation.answer,
     citations,
     evidence: evidencePackage.evidence,
+    claimAttribution,
     insufficientEvidence: generation.isInsufficientEvidence || false,
     llmUnavailable: generation.llmUnavailable || false,
+    llmError: generation.llmError,
     evidenceStatus: generation.isInsufficientEvidence ? "insufficient" : "sufficient",
     evidenceEvaluation: {
       sufficient: !generation.isInsufficientEvidence,
@@ -474,6 +639,11 @@ export async function research(query, options = {}) {
     source: "web_search",
     answeredByLLM: false,
     searchedWeb: true,
-    warnings: warnings.length > 0 ? warnings : undefined,
+    warnings: resultWarnings.length > 0 ? resultWarnings : undefined,
+    researchMetadata: {
+      ...researchMetadata,
+      timeToFirstTokenMs: generation.timing?.timeToFirstTokenMs ?? null,
+      generationTimeMs: generation.timing?.generationTimeMs ?? null,
+    },
   };
 }

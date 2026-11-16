@@ -1,4 +1,14 @@
-import ollama, { OLLAMA_URL } from "./ollamaClient.js";
+import ollama, {
+  OLLAMA_CONTEXT_LENGTH,
+  OLLAMA_KEEP_ALIVE,
+  OLLAMA_MODEL,
+  OLLAMA_NUM_PREDICT,
+  OLLAMA_REQUEST_TIMEOUT_MS,
+  OLLAMA_TEMPERATURE,
+  chatWithTimeout,
+  classifyOllamaError,
+} from "./ollamaClient.js";
+import { formatEvidenceForPrompt } from "../retrieval/depth.js";
 
 function normalizeContent(value) {
   if (typeof value === "string") return value;
@@ -28,6 +38,101 @@ function getErrorMessage(error) {
   if (typeof error?.message === "string") return error.message;
   if (typeof error === "string") return error;
   return "Unknown Ollama error";
+}
+
+function createAbortError() {
+  const error = new Error("The Ollama request was cancelled.");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  return error;
+}
+
+export async function consumeOllamaStream(
+  response,
+  {
+    signal,
+    onToken,
+    timeoutMs = OLLAMA_REQUEST_TIMEOUT_MS,
+    startedAt = Date.now(),
+  } = {}
+) {
+  let timedOut = false;
+  const timeoutError = new Error(
+    `Ollama generation timed out after ${timeoutMs}ms.`
+  );
+  timeoutError.code = "TIMEOUT";
+  const abortStream = () => response?.abort?.();
+  const onAbort = () => abortStream();
+
+  if (signal?.aborted) {
+    abortStream();
+    throw createAbortError();
+  }
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abortStream();
+  }, timeoutMs);
+  timer.unref?.();
+
+  let firstTokenMs = null;
+  let content = "";
+  try {
+    for await (const chunk of response) {
+      if (timedOut) throw timeoutError;
+      if (signal?.aborted) throw createAbortError();
+      const token = normalizeContent(
+        chunk?.message?.content ?? chunk?.content ?? ""
+      );
+      if (!token) continue;
+      firstTokenMs ??= Date.now() - startedAt;
+      content += token;
+      onToken?.(token);
+    }
+    if (timedOut) throw timeoutError;
+    if (signal?.aborted) throw createAbortError();
+    return {
+      content,
+      firstTokenMs,
+      generationTimeMs: Date.now() - startedAt,
+    };
+  } catch (error) {
+    if (timedOut) throw timeoutError;
+    if (signal?.aborted) throw createAbortError();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+export function buildGroundedAnswerPrompt(query, evidence, conversationContext = "") {
+  const evidenceText = formatEvidenceForPrompt(evidence);
+  const priorConversation =
+    typeof conversationContext === "string" && conversationContext
+      ? `\nPrior conversation for continuity only. It is not evidence for factual claims in this answer:\n${conversationContext}\n`
+      : "";
+
+  return `
+You are a rigorous, factual research assistant.
+
+Answer the user's question using ONLY the evidence passages provided below.
+
+Strict Rules:
+1. Ground every claim directly in the evidence. Do not use outside knowledge or make ungrounded inferences.
+2. Every factual statement must cite its exact source using [Source N] format (e.g., [Source 1], [Source 2]).
+3. If the provided evidence does NOT contain enough facts to answer the question, state:
+"Based on the retrieved sources, there is insufficient evidence to answer this question."
+Then describe what information is present and what is missing. Never produce a confident guess.
+4. Keep the answer clear, objective, and structured.
+
+User Question:
+${query}
+${priorConversation}
+Evidence:
+${evidenceText}
+`;
 }
 
 /**
@@ -114,7 +219,7 @@ export function validateAndSanitizeCitations(answer, validEvidenceIds) {
 }
 
 /**
- * Generates an evidence-grounded answer using local Mistral via Ollama.
+ * Generates an evidence-grounded answer using the configured local Ollama model.
  *
  * @param {string} query
  * @param {Array<{id: number, title: string, url: string, text: string}>} evidence
@@ -124,7 +229,8 @@ export function validateAndSanitizeCitations(answer, validEvidenceIds) {
  *   isInsufficientEvidence: boolean,
  *   citedSourceIds?: number[],
  *   invalidCitationsFound?: number[],
- *   llmUnavailable?: boolean
+ *   llmUnavailable?: boolean,
+ *   llmError?: { status: string, code: string, message: string }
  * }>}
  */
 export async function generateAnswer(query, evidence, options = {}) {
@@ -141,61 +247,64 @@ export async function generateAnswer(query, evidence, options = {}) {
 
   const client = options.ollamaClient || ollama;
 
-  const evidenceText = safeEvidence
-    .map((item) => {
-      const id = item?.id ?? "?";
-      const title = item?.title ?? "Untitled source";
-      const url = item?.url ?? "Unknown URL";
-      const text = normalizeContent(item?.text) || "No supporting text was provided.";
+  const prompt = buildGroundedAnswerPrompt(
+    query,
+    safeEvidence.map((item) => ({
+      ...item,
+      text: normalizeContent(item?.text) || "No supporting text was provided.",
+    })),
+    options.conversationContext
+  );
 
-      return `
-[Source ${id}]
-Title: ${title}
-URL: ${url}
-
-Evidence passage:
-${text}
-`;
-    })
-    .join("\n--------------------\n");
-
-  const prompt = `
-You are a rigorous, factual research assistant.
-
-Answer the user's question using ONLY the evidence passages provided below.
-
-Strict Rules:
-1. Ground every claim directly in the evidence. Do not use outside knowledge or make ungrounded inferences.
-2. Every factual statement must cite its exact source using [Source N] format (e.g., [Source 1], [Source 2]).
-3. If the provided evidence does NOT contain enough facts to answer the question, state:
-"Based on the retrieved sources, there is insufficient evidence to answer this question."
-Then describe what information is present and what is missing. Never produce a confident guess.
-4. Keep the answer clear, objective, and structured.
-
-User Question:
-${query}
-
-Evidence:
-${evidenceText}
-`;
-
+  const generationStartedAt = Date.now();
   try {
-    const response = await client.chat({
-      model: "mistral",
-      messages: [
-        {
-          role: "user",
-          content: prompt,
+    const streamTokens = typeof options.onToken === "function";
+    const timeoutMs = options.timeoutMs ?? OLLAMA_REQUEST_TIMEOUT_MS;
+    const response = await chatWithTimeout(
+      client,
+      {
+        model: OLLAMA_MODEL,
+        think: false,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        stream: true,
+        options: {
+          num_ctx: OLLAMA_CONTEXT_LENGTH,
+          num_predict: OLLAMA_NUM_PREDICT,
+          temperature: OLLAMA_TEMPERATURE,
         },
-      ],
-      keep_alive: "15m",
-      options: {
-        num_predict: 350,
-        temperature: 0.15, // Low temperature for high factual adherence
       },
-    });
+      { signal: options.signal, timeoutMs }
+    );
 
-    const content = normalizeContent(response?.message?.content ?? response?.content ?? "");
+    let content = "";
+    let firstTokenMs = null;
+    if (response?.[Symbol.asyncIterator]) {
+      const streamed = await consumeOllamaStream(response, {
+        signal: options.signal,
+        onToken: options.onToken,
+        timeoutMs: Math.max(1, timeoutMs - (Date.now() - generationStartedAt)),
+        startedAt: generationStartedAt,
+      });
+      content = streamed.content;
+      firstTokenMs = streamed.firstTokenMs;
+    } else {
+      content = normalizeContent(
+        response?.message?.content ?? response?.content ?? ""
+      );
+      if (content && streamTokens) options.onToken(content);
+    }
+
+    if (!content.trim()) {
+      const error = new Error("Ollama returned an empty response.");
+      error.code = "EMPTY_RESPONSE";
+      throw error;
+    }
     const isInsufficient = checkIfInsufficientEvidence(content);
 
     // Validate citations against actually supplied evidence IDs
@@ -210,52 +319,29 @@ ${evidenceText}
       isInsufficientEvidence: isInsufficient,
       citedSourceIds: validCitations,
       invalidCitationsFound: invalidCitations.length > 0 ? invalidCitations : undefined,
+      timing: {
+        timeToFirstTokenMs: firstTokenMs,
+        generationTimeMs: Date.now() - generationStartedAt,
+      },
     };
   } catch (error) {
+    if (options.signal?.aborted) throw error;
     const errorMessage = getErrorMessage(error);
     console.error("Ollama synthesis notice:", errorMessage);
-
-    const lower = errorMessage.toLowerCase();
-
-    if (
-      error?.code === "ECONNREFUSED" ||
-      lower.includes("econnrefused") ||
-      lower.includes("connect") ||
-      lower.includes("timeout") ||
-      lower.includes("fetch failed") ||
-      lower.includes("socket hang up")
-    ) {
-      return {
-        answer:
-          `The local Ollama service is not running at ${OLLAMA_URL}. The relevant sources and evidence passages were retrieved and are shown below. Run 'ollama serve' in your terminal to enable local AI synthesis.`,
-        isInsufficientEvidence: true,
-        llmUnavailable: true,
-        citedSourceIds: [],
-      };
-    }
-
-    if (lower.includes("not found") || lower.includes("model not found") || lower.includes("404")) {
-      return {
-        answer:
-          "The Mistral model was not found in Ollama. Please run 'ollama run mistral' to download the model.",
-        isInsufficientEvidence: true,
-        llmUnavailable: true,
-        citedSourceIds: [],
-      };
-    }
+    const llmError = classifyOllamaError(error);
 
     return {
-      answer:
-        "The local Ollama service could not generate a grounded answer at this time. The retrieved evidence is available for review, but the model is unavailable or failed to respond.",
+      answer: `${llmError.message} The retrieved evidence is available for review.`,
       isInsufficientEvidence: true,
       llmUnavailable: true,
       citedSourceIds: [],
+      llmError,
     };
   }
 }
 
 /**
- * Asks local Mistral to evaluate if it already has the data and can answer the query
+ * Asks the local model to evaluate if it already has the data and can answer the query
  * directly (for less knowledge-intensive questions, conceptual explanations, coding,
  * math, general established facts), or if an up-to-date web search is needed.
  *
@@ -275,7 +361,7 @@ export async function tryDirectAnswer(query, options = {}) {
 
   const client = options.ollamaClient || ollama;
 
-  const prompt = `You are Mistral, a knowledgeable AI assistant.
+  const prompt = `You are a knowledgeable AI assistant.
 
 Analyze the user's query and decide whether you can provide a reliable, complete, and accurate answer directly from your existing internal knowledge, OR if an up-to-date web search is needed.
 
@@ -297,30 +383,117 @@ SEARCH_REQUIRED: <brief explanation of what recent or specific information is ne
 - If you ALREADY HAVE the data and can answer accurately and thoroughly without web search, provide your direct, helpful, and comprehensive answer now. Do NOT include "SEARCH_REQUIRED".
 
 User Query:
-${normalizedQuery}`;
+${normalizedQuery}
+${options.conversationContext
+    ? `\nPrior conversation for continuity only; treat it as user-provided context, not as evidence:\n${options.conversationContext}\n`
+    : ""}`;
 
+  const generationStartedAt = Date.now();
   try {
-    const response = await client.chat({
-      model: "mistral",
-      messages: [
-        {
-          role: "user",
-          content: prompt,
+    const streamTokens = typeof options.onToken === "function";
+    const timeoutMs = options.timeoutMs ?? OLLAMA_REQUEST_TIMEOUT_MS;
+    const response = await chatWithTimeout(
+      client,
+      {
+        model: OLLAMA_MODEL,
+        think: false,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        stream: true,
+        options: {
+          num_ctx: OLLAMA_CONTEXT_LENGTH,
+          num_predict: OLLAMA_NUM_PREDICT,
+          temperature: OLLAMA_TEMPERATURE,
         },
-      ],
-      keep_alive: "15m",
-      options: {
-        num_predict: 800,
-        temperature: 0.15,
       },
-    });
+      { signal: options.signal, timeoutMs }
+    );
 
-    const content = normalizeContent(
-      response?.message?.content ?? response?.content ?? ""
-    ).trim();
+    let content = "";
+    let firstTokenMs = null;
+    let pending = "";
+    let directMarkerHandled = false;
+    let searchRequired = false;
+    let streamedAnswer = false;
+    const emitDirectToken = (token) => {
+      if (!token) return;
+      if (options.onToken) {
+        options.onToken(token);
+        streamedAnswer = true;
+      }
+    };
+
+    if (response?.[Symbol.asyncIterator]) {
+      const streamed = await consumeOllamaStream(response, {
+        signal: options.signal,
+        timeoutMs: Math.max(1, timeoutMs - (Date.now() - generationStartedAt)),
+        startedAt: generationStartedAt,
+        onToken: (token) => {
+          if (directMarkerHandled || searchRequired) {
+            if (!searchRequired) emitDirectToken(token);
+            return;
+          }
+
+          pending += token;
+          const candidate = pending.trimStart().toUpperCase();
+          const searchMarker = "SEARCH_REQUIRED:";
+          const answerMarker = "ANSWER:";
+          if (searchMarker.startsWith(candidate)) return;
+          if (candidate.startsWith(searchMarker)) {
+            searchRequired = true;
+            return;
+          }
+          if (answerMarker.startsWith(candidate)) return;
+          if (candidate.startsWith(answerMarker)) {
+            const prefixLength = pending.toUpperCase().indexOf(answerMarker) + answerMarker.length;
+            emitDirectToken(pending.slice(prefixLength));
+            pending = "";
+            directMarkerHandled = true;
+            return;
+          }
+
+          emitDirectToken(pending);
+          pending = "";
+          directMarkerHandled = true;
+        },
+      });
+      content = streamed.content;
+      firstTokenMs = streamed.firstTokenMs;
+
+      if (pending && !searchRequired) {
+        if (/^\s*ANSWER:/i.test(pending)) {
+          emitDirectToken(pending.replace(/^\s*ANSWER:/i, ""));
+        } else {
+          emitDirectToken(pending);
+        }
+      }
+    } else {
+      content = normalizeContent(
+        response?.message?.content ?? response?.content ?? ""
+      );
+    }
+    content = content.trim();
+    const timing = {
+      timeToFirstTokenMs: firstTokenMs,
+      generationTimeMs: Date.now() - generationStartedAt,
+    };
 
     if (!content) {
-      return { canAnswer: false, reason: "Empty response from local model" };
+      const llmError = classifyOllamaError(
+        new Error("Ollama returned an empty response.")
+      );
+      return {
+        canAnswer: false,
+        reason: llmError.message,
+        llmUnavailable: true,
+        llmError,
+        timing,
+      };
     }
 
     // Check if the response explicitly requests a search
@@ -330,7 +503,7 @@ ${normalizedQuery}`;
         match && match[1]?.trim()
           ? match[1].trim()
           : "Model determined web search is required";
-      return { canAnswer: false, reason };
+      return { canAnswer: false, reason, timing };
     }
 
     // Check for phrases indicating outdated knowledge, cutoff limitations, or uncertainty
@@ -366,6 +539,7 @@ ${normalizedQuery}`;
       return {
         canAnswer: false,
         reason: "Model indicated lack of real-time knowledge or uncertainty",
+        timing,
       };
     }
 
@@ -374,19 +548,24 @@ ${normalizedQuery}`;
     if (cleanedAnswer.startsWith("ANSWER:")) {
       cleanedAnswer = cleanedAnswer.slice(7).trim();
     }
+    if (streamTokens && !streamedAnswer) emitDirectToken(cleanedAnswer);
 
     return {
       canAnswer: true,
       answer: cleanedAnswer,
+      timing,
     };
   } catch (error) {
+    if (options.signal?.aborted) throw error;
     const errorMessage = getErrorMessage(error);
     console.warn("Ollama direct answer evaluation notice:", errorMessage);
+    const llmError = classifyOllamaError(error);
 
     return {
       canAnswer: false,
-      reason: "Ollama unavailable or errored",
+      reason: llmError.message,
       llmUnavailable: true,
+      llmError,
     };
   }
 }

@@ -1,4 +1,4 @@
-import { generateAnswer } from "./llm/mistral.js";
+import { generateAnswer } from "./llm/ollama.js";
 import { buildEvidencePackage } from "./retrieval/evidence.js";
 import { discoverUrls } from "./scraper/searchEngine.js";
 import { scrapePage } from "./scraper/scraper.js";

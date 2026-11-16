@@ -229,5 +229,10 @@ export function diversifySources(rankedCandidates, maxPerSource = 2, targetCount
     selected.push(deferred.shift());
   }
 
-  return selected;
+  const candidateOrder = new Map(
+    rankedCandidates.map((candidate, index) => [candidate, index])
+  );
+  return selected.sort(
+    (first, second) => candidateOrder.get(first) - candidateOrder.get(second)
+  );
 }

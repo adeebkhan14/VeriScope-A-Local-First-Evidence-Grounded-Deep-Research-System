@@ -1,13 +1,17 @@
 import express from "express";
 import cors from "cors";
-import axios from "axios";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createSearchRouter } from "./routes/search.js";
-import { OLLAMA_URL } from "./llm/ollamaClient.js";
+import { checkServiceHealth } from "./llm/ollamaHealth.js";
+import { getMonitoringSnapshot } from "./monitoring.js";
 
-export function createApp({ researchFn } = {}) {
+export function createApp({
+  researchFn,
+  healthCheckFn = checkServiceHealth,
+  monitoringFn = getMonitoringSnapshot,
+} = {}) {
   const app = express();
 
   app.use(cors());
@@ -21,38 +25,23 @@ export function createApp({ researchFn } = {}) {
   });
 
   /**
-   * Health check endpoint verifying connectivity to local auxiliary services.
+   * Health check endpoint verifying local service connectivity without model generation.
    */
   app.get("/api/health", async (req, res) => {
-    const checkService = async (url) => {
-      try {
-        await axios.get(url, { timeout: 5000 });
-        return { available: true };
-      } catch (err) {
-        return { available: false, error: err.code || err.message };
-      }
-    };
-
-    const searxngUrl = process.env.SEARXNG_URL || "http://localhost:8080";
-    const ollamaUrl = `${OLLAMA_URL}/api/tags`;
-    const embeddingBaseUrl = process.env.EMBEDDING_URL
-      ? process.env.EMBEDDING_URL.replace(/\/embed\/?$/, "")
-      : "http://127.0.0.1:8000";
-
-    const [searxng, ollama, embedding] = await Promise.all([
-      checkService(`${searxngUrl}/search?q=test&format=json`),
-      checkService(ollamaUrl),
-      checkService(`${embeddingBaseUrl}/`),
-    ]);
-
+    const services = await healthCheckFn();
     res.json({
-      status: "running",
-      services: {
-        searxng: { ...searxng, url: searxngUrl },
-        ollama: { ...ollama, url: OLLAMA_URL },
-        embedding: { ...embedding, url: embeddingBaseUrl },
-      },
+      status: "online",
+      backend: { status: "online" },
+      services,
     });
+  });
+
+  app.get("/api/monitoring", async (req, res, next) => {
+    try {
+      return res.json(await monitoringFn());
+    } catch (error) {
+      return next(error);
+    }
   });
 
   app.use("/api/search", createSearchRouter(researchFn));

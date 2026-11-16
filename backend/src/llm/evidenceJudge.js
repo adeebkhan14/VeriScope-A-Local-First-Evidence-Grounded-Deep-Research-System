@@ -1,7 +1,15 @@
-import ollama, { OLLAMA_URL } from "./ollamaClient.js";
+import ollama, {
+  OLLAMA_CONTEXT_LENGTH,
+  OLLAMA_KEEP_ALIVE,
+  OLLAMA_MODEL,
+  OLLAMA_NUM_PREDICT,
+  chatWithTimeout,
+  classifyOllamaError,
+} from "./ollamaClient.js";
+import { consumeOllamaStream } from "./ollama.js";
 
 /**
- * Builds the strict evidence-sufficiency prompt for Mistral.
+ * Builds the strict evidence-sufficiency prompt for the local model.
  * Enforces evaluation ONLY on the provided retrieved passages and ignores pretrained knowledge.
  *
  * @param {string} query
@@ -167,7 +175,8 @@ export function parseAndValidateJudgeResponse(rawText) {
  *   missing: string | null,
  *   status: "sufficient" | "insufficient" | "verification_failed",
  *   error?: string,
- *   errorCode?: string
+ *   errorCode?: string,
+ *   llmError?: { status: string, code: string, message: string }
  * }>}
  */
 export async function evaluateEvidenceSufficiency(query, evidence, options = {}) {
@@ -195,47 +204,50 @@ export async function evaluateEvidenceSufficiency(query, evidence, options = {})
   }
 
   const client = options.ollamaClient || ollama;
-  const model = options.model || "mistral";
-  // Generous 60-second default for local 7B models on Apple Silicon / CPU
+  const model = OLLAMA_MODEL;
+  // Generous default for local model evaluation.
   const timeoutMs =
     options.timeoutMs ??
     (Number(process.env.EVIDENCE_JUDGE_TIMEOUT_MS) || 60000);
 
   const prompt = buildEvidenceJudgePrompt(normalizedQuery, safeEvidence);
+  const startedAt = Date.now();
 
-  let timer;
   try {
-    const timeoutPromise = new Promise((_, reject) => {
-      timer = setTimeout(() => {
-        const timeoutError = new Error(`Evidence evaluation timed out after ${timeoutMs}ms`);
-        timeoutError.code = "TIMEOUT";
-        reject(timeoutError);
-      }, timeoutMs);
-      if (timer?.unref) timer.unref();
-    });
-
-    const chatPromise = client.chat({
-      model,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
+    const response = await chatWithTimeout(
+      client,
+      {
+        model,
+        think: false,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        format: "json",
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        stream: true,
+        options: {
+          num_ctx: OLLAMA_CONTEXT_LENGTH,
+          temperature: 0.0,
+          num_predict: Math.min(250, OLLAMA_NUM_PREDICT),
         },
-      ],
-      format: "json",
-      keep_alive: "15m", // Keep model warm in memory to avoid cold reload delays
-      options: {
-        temperature: 0.0,
-        num_predict: 250, // Short output needed for structured JSON
       },
-    });
+      { signal: options.signal, timeoutMs }
+    );
 
-    const response = await Promise.race([chatPromise, timeoutPromise]);
-
-    const rawContent =
-      response?.message?.content ??
-      response?.content ??
-      (typeof response === "string" ? response : "");
+    const rawContent = response?.[Symbol.asyncIterator]
+      ? (
+          await consumeOllamaStream(response, {
+            signal: options.signal,
+            timeoutMs: Math.max(1, timeoutMs - (Date.now() - startedAt)),
+            startedAt,
+          })
+        ).content
+      : response?.message?.content ??
+        response?.content ??
+        (typeof response === "string" ? response : "");
 
     const evaluated = parseAndValidateJudgeResponse(rawContent);
 
@@ -247,36 +259,26 @@ export async function evaluateEvidenceSufficiency(query, evidence, options = {})
 
     return evaluated;
   } catch (error) {
+    if (options.signal?.aborted) throw error;
     // Fail closed: Log diagnostic details on server and return verification_failed
     console.error("[EvidenceJudge] Verification failed (failing closed):", error.message || error);
     if (error.raw) {
       console.error("[EvidenceJudge] Raw model response:", error.raw);
     }
 
-    const errMsg = error.message || "";
-    const lower = errMsg.toLowerCase();
-    const isConnRefused =
-      error.code === "ECONNREFUSED" ||
-      lower.includes("econnrefused") ||
-      lower.includes("fetch failed") ||
-      lower.includes("connect") ||
-      lower.includes("socket hang up");
-    const isTimeout = error.code === "TIMEOUT" || lower.includes("timeout");
-    const isModelNotFound = lower.includes("not found") || lower.includes("404");
-
-    let reason = "Evidence verification could not be completed at this time.";
-    let missing = "Evidence sufficiency could not be established due to an evaluator error.";
-
-    if (isConnRefused) {
-      reason = `Local Ollama service is not running at ${OLLAMA_URL}.`;
-      missing = "Ollama is offline. Start it by running 'ollama serve' in your terminal.";
-    } else if (isTimeout) {
-      reason = `Evidence evaluator timed out after ${timeoutMs}ms.`;
-      missing = "The local model took too long to evaluate the evidence.";
-    } else if (isModelNotFound) {
-      reason = `The '${model}' model was not found in Ollama.`;
-      missing = `Download the model by running 'ollama run ${model}' in your terminal.`;
-    }
+    const llmError = classifyOllamaError(error, { model });
+    const reason =
+      error.code === "TIMEOUT"
+        ? `Evidence evaluation timed out after ${timeoutMs}ms.`
+        : llmError.message;
+    const missing =
+      llmError.status === "model_missing"
+        ? llmError.message
+        : llmError.status === "offline"
+        ? "The backend could not connect to Ollama; retrieved evidence could not be verified."
+        : llmError.status === "error" && llmError.code === "OLLAMA_TIMEOUT"
+        ? "The local model took too long to evaluate the evidence."
+        : "Evidence sufficiency could not be established due to an evaluator error.";
 
     return {
       sufficient: false,
@@ -284,9 +286,8 @@ export async function evaluateEvidenceSufficiency(query, evidence, options = {})
       missing,
       status: "verification_failed",
       error: error.message || "Unknown error during evidence evaluation",
-      errorCode: error.code || "EVALUATOR_ERROR",
+      errorCode: error.code === "TIMEOUT" ? "TIMEOUT" : llmError.code,
+      llmError,
     };
-  } finally {
-    if (timer) clearTimeout(timer);
   }
 }

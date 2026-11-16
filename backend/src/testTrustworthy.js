@@ -1,5 +1,5 @@
 import { normalizeUrl, deduplicateUrls, deduplicateChunks, diversifySources } from "./retrieval/deduplicate.js";
-import { checkIfInsufficientEvidence } from "./llm/mistral.js";
+import { checkIfInsufficientEvidence } from "./llm/ollama.js";
 import { createBM25Index } from "./retrieval/bm25.js";
 import { buildEvidencePackage } from "./retrieval/evidence.js";
 

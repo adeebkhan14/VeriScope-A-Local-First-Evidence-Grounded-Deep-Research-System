@@ -1,4 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import rehypeHighlight from 'rehype-highlight'
 import VeriscopeSymbol from './VeriscopeSymbol'
 import {
   addResearchResult,
@@ -8,6 +11,7 @@ import {
   setResearchSaved,
 } from './researchHistory'
 import './App.css'
+import 'highlight.js/styles/github-dark.css'
 
 const suggestions = ['how does Kubernetes perform service discovery?', 'how does LLM search work?', 'what is BM25 retrieval?']
 const headlinePhrases = [
@@ -21,6 +25,23 @@ function getInitialTheme() {
     return globalThis.localStorage.getItem('veriscope-theme') === 'light' ? 'light' : 'dark'
   } catch {
     return 'dark'
+  }
+}
+
+function getInitialPreference(key, allowedValues, fallback) {
+  try {
+    const value = globalThis.localStorage.getItem(key)
+    return allowedValues.includes(value) ? value : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function getInitialSessionId() {
+  try {
+    return globalThis.localStorage.getItem('veriscope-active-session') || null
+  } catch {
+    return null
   }
 }
 
@@ -72,6 +93,15 @@ function getDomain(url) {
   }
 }
 
+function getSafeExternalUrl(url) {
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : null
+  } catch {
+    return null
+  }
+}
+
 function createResultId() {
   return globalThis.crypto?.randomUUID?.() ||
     `${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -86,157 +116,205 @@ function formatResearchDate(value) {
   }).format(date)
 }
 
-/**
- * Parses synthesis text and transforms [Source N] patterns into clickable citation badges.
- */
-function renderInlineMarkdown(text, citations, onSelectSource) {
-  if (!text) return null
-  const inlinePattern = /(\[(?:Source\s*)?\d+(?:\s*,\s*(?:Source\s*)?\d+)*\]|\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/gi
-  const parts = []
-  let lastIndex = 0
-  let match
-
-  while ((match = inlinePattern.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push(text.slice(lastIndex, match.index))
-    }
-
-    const fullMatch = match[0]
-    if (/^\[(?:Source\s*)?\d/i.test(fullMatch)) {
-      const ids = fullMatch.match(/\d+/g).map(Number)
-      const isKnownCitation = ids.some((id) => citations.some((citation) => citation.id === id))
-      if (isKnownCitation) {
-        ids.forEach((id, index) => {
-          if (index > 0) parts.push(', ')
-          const source = citations.find((citation) => citation.id === id)
-          if (!source) {
-            parts.push(`[Source ${id}]`)
-            return
-          }
-          parts.push(
-            <button
-              key={`cite-${match.index}-${id}`}
-              type="button"
-              className="inline-citation"
-              onClick={() => onSelectSource(id)}
-              title={`[Source ${id}] ${source.title}`}
-              aria-label={`Jump to Source ${id}`}
-            >
-              [Source {id}]
-            </button>
-          )
-        })
-      } else {
-        parts.push(fullMatch)
-      }
-    } else if (fullMatch.startsWith('**')) {
-      parts.push(<strong key={`bold-${match.index}`}>{fullMatch.slice(2, -2)}</strong>)
-    } else if (fullMatch.startsWith('`')) {
-      parts.push(<code key={`code-${match.index}`}>{fullMatch.slice(1, -1)}</code>)
-    } else if (fullMatch.startsWith('*')) {
-      parts.push(<em key={`italic-${match.index}`}>{fullMatch.slice(1, -1)}</em>)
-    } else {
-      const linkMatch = fullMatch.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/i)
-      parts.push(
-        <a key={`link-${match.index}`} href={linkMatch[2]} target="_blank" rel="noreferrer">
-          {linkMatch[1]}
-        </a>
-      )
-    }
-
-    lastIndex = match.index + fullMatch.length
+function formatBytes(value) {
+  if (!Number.isFinite(value)) return 'Unavailable'
+  const units = ['B', 'KiB', 'MiB', 'GiB']
+  let amount = value
+  let unitIndex = 0
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024
+    unitIndex += 1
   }
-
-  if (lastIndex < text.length) {
-    parts.push(text.slice(lastIndex))
-  }
-
-  return parts
+  return `${amount.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
 }
 
-function renderAnswerMarkdown(text, citations, onSelectSource) {
-  const lines = text.split(/\r?\n/)
-  const blocks = []
-  let paragraph = []
-  let listItems = []
-  let listType = ''
-  let codeLines = []
-  let inCodeBlock = false
+function buildConversationMessages(entries, sessionId) {
+  return entries
+    .filter((entry) => entry.sessionId === sessionId && entry.query && entry.answer)
+    .sort((first, second) => first.createdAt.localeCompare(second.createdAt))
+    .slice(-8)
+    .flatMap((entry) => [
+      { role: 'user', content: entry.query.slice(0, 6000) },
+      {
+        role: 'assistant',
+        content: entry.answer.slice(0, 6000),
+        evidenceReferences: (entry.evidence || []).slice(0, 4).map((item) => ({
+          title: item.title || 'Web source',
+          url: item.url || '',
+          chunkId: item.chunkId,
+        })),
+      },
+    ])
+}
 
-  const flushParagraph = () => {
-    if (paragraph.length) {
-      blocks.push(<p key={`paragraph-${blocks.length}`}>{renderInlineMarkdown(paragraph.join(' '), citations, onSelectSource)}</p>)
-      paragraph = []
+function remarkCitations({ citationIds = [] } = {}) {
+  const knownIds = new Set(citationIds)
+  const citationPattern = /\[(?:Source\s*)?(\d+(?:\s*,\s*(?:Source\s*)?\d+)*)\]/gi
+
+  return (tree) => {
+    function transform(node) {
+      if (!Array.isArray(node.children)) return
+
+      node.children = node.children.flatMap((child) => {
+        if (child.type !== 'text') {
+          transform(child)
+          return [child]
+        }
+
+        const parts = []
+        let lastIndex = 0
+        let match
+        citationPattern.lastIndex = 0
+        while ((match = citationPattern.exec(child.value)) !== null) {
+          if (match.index > lastIndex) {
+            parts.push({ type: 'text', value: child.value.slice(lastIndex, match.index) })
+          }
+          const ids = match[1].match(/\d+/g).map(Number)
+          ids.forEach((id, index) => {
+            if (index > 0) parts.push({ type: 'text', value: ', ' })
+            if (knownIds.has(id)) {
+              parts.push({
+                type: 'link',
+                url: `#source-${id}`,
+                children: [{ type: 'text', value: `[Source ${id}]` }],
+              })
+            } else {
+              parts.push({ type: 'text', value: `[Source ${id}]` })
+            }
+          })
+          lastIndex = match.index + match[0].length
+        }
+
+        if (lastIndex === 0) return [child]
+        if (lastIndex < child.value.length) {
+          parts.push({ type: 'text', value: child.value.slice(lastIndex) })
+        }
+        return parts
+      })
     }
+
+    transform(tree)
   }
-  const flushList = () => {
-    if (!listItems.length) return
-    const List = listType === 'ordered' ? 'ol' : 'ul'
-    blocks.push(
-      <List key={`list-${blocks.length}`}>
-        {listItems.map((item, index) => (
-          <li key={`item-${index}`}>{renderInlineMarkdown(item, citations, onSelectSource)}</li>
-        ))}
-      </List>
-    )
-    listItems = []
-    listType = ''
+}
+
+function remarkClaimReferences({ claims = [] } = {}) {
+  const references = claims
+    .filter((claim) => claim?.claimId && typeof claim.claimText === 'string')
+    .map((claim, index) => ({
+      claimId: claim.claimId,
+      claimText: claim.claimText.replace(/[.!?]+$/, ''),
+      label: `Evidence ${String(index + 1).padStart(2, '0')}`,
+    }))
+    .filter((reference) => reference.claimText)
+    .sort((first, second) => second.claimText.length - first.claimText.length)
+
+  return (tree) => {
+    function transform(node) {
+      if (!Array.isArray(node.children)) return
+
+      node.children = node.children.flatMap((child) => {
+        if (child.type !== 'text') {
+          transform(child)
+          return [child]
+        }
+
+        const parts = []
+        let lastIndex = 0
+        while (lastIndex < child.value.length) {
+          let selected = null
+          let selectedIndex = child.value.length
+          for (const reference of references) {
+            const index = child.value.indexOf(reference.claimText, lastIndex)
+            if (index !== -1 && index < selectedIndex) {
+              selected = reference
+              selectedIndex = index
+            }
+          }
+          if (!selected) break
+
+          if (selectedIndex > lastIndex) {
+            parts.push({ type: 'text', value: child.value.slice(lastIndex, selectedIndex) })
+          }
+          const endIndex = selectedIndex + selected.claimText.length
+          parts.push({ type: 'text', value: child.value.slice(selectedIndex, endIndex) })
+          parts.push({
+            type: 'link',
+            url: `#evidence-${selected.claimId}`,
+            children: [{ type: 'text', value: ` ${selected.label}` }],
+          })
+          lastIndex = endIndex
+        }
+
+        if (lastIndex === 0) return [child]
+        if (lastIndex < child.value.length) {
+          parts.push({ type: 'text', value: child.value.slice(lastIndex) })
+        }
+        return parts
+      })
+    }
+
+    transform(tree)
+  }
+}
+
+async function readSearchStream(response, onStatus, onToken) {
+  if (!response.body) {
+    throw new Error('The research service returned an empty stream.')
   }
 
-  lines.forEach((line) => {
-    if (line.trim().startsWith('```')) {
-      flushParagraph()
-      flushList()
-      if (inCodeBlock) {
-        blocks.push(<pre key={`pre-${blocks.length}`}><code>{codeLines.join('\n')}</code></pre>)
-        codeLines = []
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let result = null
+
+  const processFrame = (frame) => {
+    let event = 'message'
+    const data = []
+    for (const line of frame.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      if (line.startsWith('data:')) data.push(line.slice(5).trim())
+    }
+    if (data.length === 0) return
+
+    const payload = JSON.parse(data.join('\n'))
+    if (event === 'status') onStatus(payload.message)
+    if (event === 'token') onToken(payload.text)
+    if (event === 'done') result = payload.result
+    if (event === 'error') throw new Error(payload.error || 'Research could not be completed.')
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, '\n')
+      let frameEnd
+      while ((frameEnd = buffer.indexOf('\n\n')) !== -1) {
+        processFrame(buffer.slice(0, frameEnd))
+        buffer = buffer.slice(frameEnd + 2)
       }
-      inCodeBlock = !inCodeBlock
-      return
+      if (done) break
     }
-    if (inCodeBlock) {
-      codeLines.push(line)
-      return
-    }
-
-    const heading = line.match(/^(#{1,3})\s+(.+)$/)
-    const unordered = line.match(/^\s*[-*]\s+(.+)$/)
-    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/)
-    const quote = line.match(/^>\s?(.*)$/)
-    if (!line.trim()) {
-      flushParagraph()
-      flushList()
-    } else if (heading) {
-      flushParagraph()
-      flushList()
-      const Heading = `h${Math.min(heading[1].length + 1, 4)}`
-      blocks.push(<Heading key={`heading-${blocks.length}`}>{renderInlineMarkdown(heading[2], citations, onSelectSource)}</Heading>)
-    } else if (unordered || ordered) {
-      flushParagraph()
-      const nextListType = unordered ? 'unordered' : 'ordered'
-      if (listType && listType !== nextListType) flushList()
-      listType = nextListType
-      listItems.push((unordered || ordered)[1])
-    } else if (quote) {
-      flushParagraph()
-      flushList()
-      blocks.push(<blockquote key={`quote-${blocks.length}`}>{renderInlineMarkdown(quote[1], citations, onSelectSource)}</blockquote>)
-    } else {
-      flushList()
-      paragraph.push(line.trim())
-    }
-  })
-
-  if (inCodeBlock) {
-    blocks.push(<pre key={`pre-${blocks.length}`}><code>{codeLines.join('\n')}</code></pre>)
+    if (buffer.trim()) processFrame(buffer)
+  } finally {
+    reader.releaseLock()
   }
-  flushParagraph()
-  flushList()
-  return blocks
+
+  if (!result) {
+    throw new Error('The research stream ended before returning a result.')
+  }
+  return result
 }
 
 function App() {
   const [theme, setTheme] = useState(getInitialTheme)
+  const [preferenceError, setPreferenceError] = useState('')
+  const [researchDepth, setResearchDepth] = useState(() =>
+    getInitialPreference('veriscope-research-depth', ['FAST', 'NORMAL', 'MAX'], 'NORMAL')
+  )
+  const [hybridAlpha, setHybridAlpha] = useState(() =>
+    getInitialPreference('veriscope-hybrid-alpha', ['0.3', '0.5', '0.7'], '0.5')
+  )
+  const [activeSessionId, setActiveSessionId] = useState(getInitialSessionId)
   const [themeError, setThemeError] = useState('')
   const [headlineIndex, setHeadlineIndex] = useState(0)
   const [query, setQuery] = useState('')
@@ -244,14 +322,18 @@ function App() {
   const [answer, setAnswer] = useState('')
   const [citations, setCitations] = useState([])
   const [evidence, setEvidence] = useState([])
+  const [claimAttribution, setClaimAttribution] = useState(null)
   const [insufficientEvidence, setInsufficientEvidence] = useState(false)
   const [answeredByLLM, setAnsweredByLLM] = useState(false)
   const [_searchedWeb, setSearchedWeb] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
+  const [progressStatus, setProgressStatus] = useState('')
   const [error, setError] = useState('')
   const [evidenceStatus, setEvidenceStatus] = useState('')
+  const [llmError, setLlmError] = useState(null)
   const [serviceHealth, setServiceHealth] = useState(null)
   const [activeSourceId, setActiveSourceId] = useState(null)
+  const [openClaimId, setOpenClaimId] = useState(null)
   const [researchHistory, setResearchHistory] = useState([])
   const [historySearch, setHistorySearch] = useState('')
   const [historyFilter, setHistoryFilter] = useState('all')
@@ -259,7 +341,15 @@ function App() {
   const [historyError, setHistoryError] = useState('')
   const [currentResultId, setCurrentResultId] = useState(null)
   const [copyStatus, setCopyStatus] = useState('')
+  const [researchMetadata, setResearchMetadata] = useState(null)
+  const [runtimeMetrics, setRuntimeMetrics] = useState(null)
+  const [runtimeError, setRuntimeError] = useState('')
+  const [runtimeLoading, setRuntimeLoading] = useState(false)
+  const searchController = useRef(null)
   const isDirectAnswer = answeredByLLM && !_searchedWeb
+  const claimEvidence = Array.isArray(claimAttribution?.claims)
+    ? claimAttribution.claims
+    : []
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
@@ -270,6 +360,28 @@ function App() {
   }, [theme])
 
   useEffect(() => {
+    try {
+      globalThis.localStorage.setItem('veriscope-research-depth', researchDepth)
+      globalThis.localStorage.setItem('veriscope-hybrid-alpha', hybridAlpha)
+      setPreferenceError('')
+    } catch {
+      setPreferenceError('Research settings will not persist because browser storage is unavailable.')
+    }
+  }, [researchDepth, hybridAlpha])
+
+  useEffect(() => {
+    try {
+      if (activeSessionId) {
+        globalThis.localStorage.setItem('veriscope-active-session', activeSessionId)
+      } else {
+        globalThis.localStorage.removeItem('veriscope-active-session')
+      }
+    } catch {
+      setPreferenceError('The active conversation will not persist because browser storage is unavailable.')
+    }
+  }, [activeSessionId])
+
+  useEffect(() => {
     if (searchedQuery || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined
     const timer = window.setInterval(() => {
       setHeadlineIndex((index) => (index + 1) % headlinePhrases.length)
@@ -278,20 +390,44 @@ function App() {
   }, [searchedQuery])
 
   useEffect(() => {
+    let active = true
+    let timer
+    let controller
+
     async function checkHealth() {
       try {
-        const res = await fetch('/api/health')
-        if (res.ok) {
-          const data = await res.json()
-          setServiceHealth(data.services || null)
+        controller = new AbortController()
+        const res = await fetch('/api/health', {
+          cache: 'no-store',
+          signal: controller.signal,
+        })
+        if (!res.ok) {
+          throw new Error(`Backend health returned HTTP ${res.status}`)
         }
-      } catch {
-        // Backend not ready or unreachable
+        const data = await res.json()
+        if (active) setServiceHealth(data)
+      } catch (healthError) {
+        if (active && healthError?.name !== 'AbortError') {
+          setServiceHealth({
+            status: 'error',
+            backend: { status: 'offline' },
+            services: null,
+            error: healthError instanceof Error
+              ? healthError.message
+              : 'Backend health is not yet available.',
+          })
+        }
+      } finally {
+        if (active) timer = window.setTimeout(checkHealth, 30000)
       }
     }
+
     checkHealth()
-    const timer = setInterval(checkHealth, 20000)
-    return () => clearInterval(timer)
+    return () => {
+      active = false
+      controller?.abort()
+      window.clearTimeout(timer)
+    }
   }, [])
 
   useEffect(() => {
@@ -329,6 +465,15 @@ function App() {
     }
   }
 
+  function scrollToClaimEvidence(claimId) {
+    const targetElement = document.getElementById(`claim-evidence-${claimId}`)
+    if (!targetElement) return
+
+    setOpenClaimId(claimId)
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    targetElement.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' })
+  }
+
   function changeTheme() {
     const nextTheme = theme === 'dark' ? 'light' : 'dark'
     setTheme(nextTheme)
@@ -340,20 +485,67 @@ function App() {
     }
   }
 
+  function startNewConversation() {
+    const newSessionId = createResultId()
+    setActiveSessionId(newSessionId)
+    setCurrentResultId(null)
+    setSearchedQuery('')
+    setAnswer('')
+    setCitations([])
+    setEvidence([])
+    setClaimAttribution(null)
+    setResearchMetadata(null)
+    setError('')
+    setQuery('')
+  }
+
+  function stopSearch() {
+    searchController.current?.abort()
+  }
+
+  async function refreshRuntimeMetrics() {
+    setRuntimeLoading(true)
+    setRuntimeError('')
+    try {
+      const response = await fetch('/api/monitoring', { cache: 'no-store' })
+      if (!response.ok) {
+        throw new Error(`Runtime metrics returned HTTP ${response.status}.`)
+      }
+      setRuntimeMetrics(await response.json())
+    } catch (monitoringError) {
+      setRuntimeError(
+        monitoringError instanceof Error
+          ? monitoringError.message
+          : 'Runtime metrics could not be loaded.'
+      )
+    } finally {
+      setRuntimeLoading(false)
+    }
+  }
+
   async function handleSearch(event, options = {}) {
     event?.preventDefault()
     const trimmedQuery = query.trim()
     if (!trimmedQuery || isLoading) return
 
     const forceWeb = Boolean(options.forceWebSearch)
+    const sessionId = activeSessionId || createResultId()
+    const controller = new AbortController()
+    searchController.current = controller
+    setActiveSessionId(sessionId)
 
     setIsLoading(true)
+    setProgressStatus('Starting local research...')
     setError('')
     setAnswer('')
     setCitations([])
     setEvidence([])
+    setClaimAttribution(null)
+    setOpenClaimId(null)
     setInsufficientEvidence(false)
     setEvidenceStatus('')
+    setLlmError(null)
+    setResearchMetadata(null)
     setAnsweredByLLM(false)
     setSearchedWeb(false)
     setActiveSourceId(null)
@@ -364,14 +556,34 @@ function App() {
     try {
       const response = await fetch('/api/search', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: trimmedQuery, forceWebSearch: forceWeb }),
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+        },
+        body: JSON.stringify({
+          query: trimmedQuery,
+          forceWebSearch: forceWeb,
+          depth: researchDepth,
+          alpha: Number(hybridAlpha),
+          sessionId,
+          conversation: buildConversationMessages(researchHistory, sessionId),
+        }),
       })
-      const data = await response.json()
 
       if (!response.ok) {
+        const data = await response.json()
         throw new Error(data.message || data.error || 'Search could not be completed. Please try again.')
       }
+
+      const data = await readSearchStream(
+        response,
+        (status) => {
+          if (status === 'Querying SearXNG...') setAnswer('')
+          setProgressStatus(status)
+        },
+        (token) => setAnswer((currentAnswer) => currentAnswer + token)
+      )
 
       if (typeof data.answer !== 'string' || !Array.isArray(data.citations)) {
         throw new Error(data.message || 'The research service returned an unexpected response.')
@@ -380,23 +592,32 @@ function App() {
       setAnswer(data.answer)
       setCitations(data.citations)
       setEvidence(data.evidence || [])
+      setClaimAttribution(data.claimAttribution || null)
       setInsufficientEvidence(Boolean(data.insufficientEvidence))
       setEvidenceStatus(data.evidenceStatus || '')
+      setLlmError(data.llmError || null)
       setAnsweredByLLM(Boolean(data.answeredByLLM))
       setSearchedWeb(Boolean(data.searchedWeb))
+      setResearchMetadata(data.researchMetadata || null)
 
       const entry = {
         id: createResultId(),
+        sessionId: data.sessionId || sessionId,
         query: trimmedQuery,
         answer: data.answer,
         citations: data.citations,
         evidence: Array.isArray(data.evidence) ? data.evidence : [],
+        claimAttribution: data.claimAttribution || null,
         warnings: Array.isArray(data.warnings) ? data.warnings : [],
         insufficientEvidence: Boolean(data.insufficientEvidence),
         llmUnavailable: Boolean(data.llmUnavailable),
         answeredByLLM: Boolean(data.answeredByLLM),
         searchedWeb: Boolean(data.searchedWeb),
         evidenceStatus: data.evidenceStatus || '',
+        llmError: data.llmError || null,
+        researchMetadata: data.researchMetadata || null,
+        depth: researchDepth,
+        alpha: Number(hybridAlpha),
         missingEvidence: data.missingEvidence || '',
         createdAt: new Date().toISOString(),
         saved: false,
@@ -413,24 +634,39 @@ function App() {
         )
       }
     } catch (searchError) {
-      setError(searchError instanceof Error ? searchError.message : 'Something went wrong. Please try again.')
+      setError(searchError?.name === 'AbortError'
+        ? 'Research was stopped before completion.'
+        : searchError instanceof Error ? searchError.message : 'Something went wrong. Please try again.')
     } finally {
+      if (searchController.current === controller) searchController.current = null
       setIsLoading(false)
+      setProgressStatus('')
     }
   }
 
   function reopenResearch(entry) {
+    setActiveSessionId(entry.sessionId || null)
     setQuery(entry.query)
     setSearchedQuery(entry.query)
     setAnswer(entry.answer)
     setCitations(entry.citations)
     setEvidence(entry.evidence || [])
+    setClaimAttribution(entry.claimAttribution || null)
     setInsufficientEvidence(Boolean(entry.insufficientEvidence))
     setEvidenceStatus(entry.evidenceStatus || '')
+    setLlmError(entry.llmError || null)
     setAnsweredByLLM(Boolean(entry.answeredByLLM))
     setSearchedWeb(Boolean(entry.searchedWeb))
+    setResearchMetadata(entry.researchMetadata || null)
+    if (entry.depth && ['FAST', 'NORMAL', 'MAX'].includes(entry.depth)) {
+      setResearchDepth(entry.depth)
+    }
+    if (Number.isFinite(entry.alpha)) {
+      setHybridAlpha(String(entry.alpha))
+    }
     setCurrentResultId(entry.id)
     setActiveSourceId(null)
+    setOpenClaimId(null)
     setError('')
     setCopyStatus('')
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -491,6 +727,30 @@ function App() {
   }
 
   const currentResult = researchHistory.find((entry) => entry.id === currentResultId)
+  const healthServices = serviceHealth?.services
+  const backendOnline =
+    serviceHealth?.backend?.status === 'online' || serviceHealth?.status === 'online'
+  const ollamaHealth = healthServices?.ollama
+  const ollamaReachable = Boolean(ollamaHealth?.reachable ?? ollamaHealth?.available)
+  const ollamaModel = ollamaHealth?.model
+  const ollamaModelMissing =
+    ollamaHealth?.status === 'model_missing' || ollamaModel?.status === 'model_missing'
+  const healthNeedsNotice =
+    !backendOnline ||
+    (healthServices && (
+      !ollamaReachable ||
+      ollamaModelMissing ||
+      ollamaHealth?.status === 'error' ||
+      healthServices.searxng?.status !== 'online' ||
+      healthServices.embedding?.status !== 'online'
+    ))
+  const backendStatusLabel = !backendOnline
+    ? 'BACKEND STARTING'
+    : ollamaModelMissing
+    ? 'BACKEND ONLINE · MODEL MISSING'
+    : !ollamaReachable
+    ? 'BACKEND ONLINE · OLLAMA UNREACHABLE'
+    : 'BACKEND ONLINE'
   const visibleHistory = researchHistory.filter((entry) => {
     const matchesFilter = historyFilter === 'all' || entry.saved
     const normalizedSearch = historySearch.trim().toLocaleLowerCase()
@@ -511,17 +771,23 @@ function App() {
         </a>
         <div
           className={`service-indicator ${serviceHealth
-            ? Object.values(serviceHealth).every((service) => service?.available) ? 'service-connected' : 'service-degraded'
+            ? backendOnline ? 'service-connected' : 'service-degraded'
             : 'service-unknown'}`}
           role="status"
           title={serviceHealth
-            ? Object.entries(serviceHealth).map(([name, service]) => `${name}: ${service?.available ? 'connected' : 'offline'}`).join(' · ')
+            ? [
+                `backend: ${backendOnline ? 'online' : 'starting or unreachable'}`,
+                ollamaHealth
+                  ? `ollama: ${ollamaReachable ? 'online' : ollamaHealth.status}`
+                  : 'ollama: status unavailable',
+                ollamaModel?.name
+                  ? `${ollamaModel.name}: ${ollamaModel.installed ? 'installed' : ollamaModel.status}`
+                  : '',
+              ].filter(Boolean).join(' · ')
             : 'Local services are checked in the background'}
         >
           <span className="status-dot" />
-          <span>{serviceHealth
-            ? Object.values(serviceHealth).every((service) => service?.available) ? 'ALL SYSTEMS CONNECTED' : 'LOCAL SERVICES DEGRADED'
-            : 'LOCAL-FIRST RESEARCH'}</span>
+          <span>{serviceHealth ? backendStatusLabel : 'LOCAL-FIRST RESEARCH'}</span>
         </div>
         <nav className="topbar-actions" aria-label="Main navigation">
           <a className="about-link" href="#research-library">Library</a>
@@ -541,24 +807,95 @@ function App() {
       </header>
 
       {themeError && <p className="preference-error" role="status">{themeError}</p>}
+      {preferenceError && <p className="preference-error" role="status">{preferenceError}</p>}
 
-      {serviceHealth && (!serviceHealth.ollama?.available || !serviceHealth.searxng?.available || !serviceHealth.embedding?.available) && (
+      {serviceHealth && healthNeedsNotice && (
         <div className="service-alert-bar" role="status">
           <span className="service-alert-icon" aria-hidden="true">!</span>
           <span>
             <strong>Local service notice:</strong>{' '}
-            {!serviceHealth.ollama?.available && (
-              <span className="offline-tag">Ollama is offline (run <code>ollama serve</code>). </span>
+            {!backendOnline && (
+              <span className="offline-tag">Backend health is not available yet; the UI will retry automatically. </span>
             )}
-            {!serviceHealth.searxng?.available && (
-              <span className="offline-tag">SearXNG is offline (start Docker container). </span>
+            {ollamaHealth && !ollamaReachable && (
+              <span className="offline-tag">
+                Ollama is unreachable from the backend at <code>{ollamaHealth.url}</code>. {ollamaHealth.error || 'Check the Ollama service and backend network path.'}{' '}
+              </span>
             )}
-            {!serviceHealth.embedding?.available && (
+            {ollamaHealth && ollamaReachable && ollamaModelMissing && (
+              <span className="offline-tag">
+                Ollama is online, but <code>{ollamaModel?.name || 'the configured model'}</code> is missing. Run <code>ollama pull {ollamaModel?.name || ''}</code>.{' '}
+              </span>
+            )}
+            {ollamaHealth?.status === 'error' && (
+              <span className="offline-tag">Ollama health check error: {ollamaHealth.error || 'Check OLLAMA_URL and OLLAMA_MODEL.'} </span>
+            )}
+            {healthServices?.searxng?.status !== 'online' && healthServices?.searxng && (
+              <span className="offline-tag">SearXNG is unavailable; web search may not work. </span>
+            )}
+            {healthServices?.embedding?.status !== 'online' && healthServices?.embedding && (
               <span className="offline-tag">Embedding service is offline; lexical retrieval may be used. </span>
             )}
           </span>
         </div>
       )}
+
+      <details className="runtime-monitor">
+        <summary>Runtime metrics · on demand</summary>
+        <div className="runtime-monitor-content">
+          <button
+            type="button"
+            className="result-action-button"
+            onClick={refreshRuntimeMetrics}
+            disabled={runtimeLoading}
+          >
+            {runtimeLoading ? 'Checking local runtime…' : 'Refresh metrics'}
+          </button>
+          {runtimeError && <p className="runtime-error" role="status">{runtimeError}</p>}
+          {runtimeMetrics && (
+            <dl className="runtime-metrics-grid">
+              <div>
+                <dt>Model</dt>
+                <dd>{runtimeMetrics.model?.name || 'Unavailable'} · {runtimeMetrics.model?.loaded ? 'loaded' : 'unloaded'}</dd>
+              </div>
+              <div>
+                <dt>Ollama</dt>
+                <dd>{runtimeMetrics.model?.status || 'Unavailable'}</dd>
+              </div>
+              <div>
+                <dt>GPU</dt>
+                <dd>{runtimeMetrics.gpu?.available
+                  ? `${runtimeMetrics.gpu.name} · ${runtimeMetrics.gpu.utilizationPercent}% · ${runtimeMetrics.gpu.memoryUsedMiB}/${runtimeMetrics.gpu.memoryTotalMiB} MiB`
+                  : runtimeMetrics.gpu?.error || 'Unavailable'}</dd>
+              </div>
+              <div>
+                <dt>Model allocation</dt>
+                <dd>{runtimeMetrics.model?.allocation?.processor || 'Unavailable'} · GPU {formatBytes(runtimeMetrics.model?.allocation?.gpuBytes)} / CPU {formatBytes(runtimeMetrics.model?.allocation?.cpuBytes)} (approx.)</dd>
+              </div>
+              <div>
+                <dt>CPU memory</dt>
+                <dd>{formatBytes(runtimeMetrics.cpuMemory?.usedBytes)} used / {formatBytes(runtimeMetrics.cpuMemory?.totalBytes)}</dd>
+              </div>
+              <div>
+                <dt>Loaded context</dt>
+                <dd>{runtimeMetrics.model?.contextLength ?? 'Unavailable'} tokens</dd>
+              </div>
+              <div>
+                <dt>Last retrieval</dt>
+                <dd>{runtimeMetrics.retrieval
+                  ? `${runtimeMetrics.retrieval.depth} · ${runtimeMetrics.retrieval.retrievedChunkCount} retrieved / ${runtimeMetrics.retrieval.chunksSent} sent · ~${runtimeMetrics.retrieval.evidenceTokenCount} evidence tokens`
+                  : 'Unavailable'}</dd>
+              </div>
+              <div>
+                <dt>Generation</dt>
+                <dd>{runtimeMetrics.retrieval?.timeToFirstTokenMs == null
+                  ? 'TTFT unavailable'
+                  : `${runtimeMetrics.retrieval.timeToFirstTokenMs} ms TTFT · ${runtimeMetrics.retrieval.generationTimeMs ?? 'Unavailable'} ms total`}</dd>
+              </div>
+            </dl>
+          )}
+        </div>
+      </details>
 
       <section className={`hero ${searchedQuery ? 'hero-compact' : ''}`}>
         <div className="eyebrow"><span className="eyebrow-line" /> RESEARCH, WITH RECEIPTS</div>
@@ -603,7 +940,52 @@ function App() {
             <span>{isLoading ? 'Researching' : 'Research'}</span>
             {isLoading ? <span className="button-spinner" /> : <ArrowIcon />}
           </button>
+          {isLoading && (
+            <button className="stop-button" type="button" onClick={stopSearch}>
+              Stop
+            </button>
+          )}
         </form>
+
+        <div className="research-controls">
+          <div className="depth-selector" role="group" aria-label="Research depth">
+            {['FAST', 'NORMAL', 'MAX'].map((depth) => (
+              <button
+                type="button"
+                key={depth}
+                className={researchDepth === depth ? 'depth-option depth-option-active' : 'depth-option'}
+                aria-pressed={researchDepth === depth}
+                disabled={isLoading}
+                onClick={() => setResearchDepth(depth)}
+              >
+                {depth === 'NORMAL' ? 'Normal' : depth === 'FAST' ? 'Fast' : 'Max'}
+              </button>
+            ))}
+          </div>
+          <details className="advanced-research-settings">
+            <summary>Advanced</summary>
+            <label>
+              BM25 / MiniLM balance
+              <select
+                value={hybridAlpha}
+                disabled={isLoading}
+                onChange={(event) => setHybridAlpha(event.target.value)}
+              >
+                <option value="0.3">0.3 · Semantic-heavy</option>
+                <option value="0.5">0.5 · Balanced</option>
+                <option value="0.7">0.7 · Keyword-heavy</option>
+              </select>
+            </label>
+          </details>
+          <button
+            className="new-conversation-button"
+            type="button"
+            disabled={isLoading}
+            onClick={startNewConversation}
+          >
+            New conversation
+          </button>
+        </div>
 
         <div className="local-first-note"><span className="local-first-glyph">⌘</span> Local-first · your research stays on your device</div>
 
@@ -795,9 +1177,9 @@ function App() {
             <div className="research-progress" role="status" aria-live="polite">
               <div className="progress-mark" aria-hidden="true"><span /></div>
               <div className="progress-copy">
-                <div className="results-kicker">RUNNING LOCALLY · PROGRESS IS NOT STREAMED</div>
-                <h3>Researching your question</h3>
-                <p>Your answer and its evidence status will appear here when processing is complete.</p>
+              <div className="results-kicker">LIVE RESEARCH STATUS</div>
+              <h3>{progressStatus}</h3>
+              <p>Research is running locally. Answer text appears as it is generated.</p>
                 <div className="progress-track" aria-hidden="true"><span /></div>
               </div>
             </div>
@@ -826,8 +1208,14 @@ function App() {
             </div>
           )}
 
-          {!isLoading && !error && answer && (
+          {((!isLoading && !error) || isLoading) && answer && (
             <div className="research-output">
+              {llmError && (
+                <div className="service-alert-bar" role="status">
+                  <span className="service-alert-icon" aria-hidden="true">!</span>
+                  <span><strong>Ollama response issue:</strong> {llmError.message}</span>
+                </div>
+              )}
               <article className="answer-card glass-panel">
                 <div className="answer-header">
                   <div className="answer-label">
@@ -885,10 +1273,206 @@ function App() {
                   <p className="copy-feedback" role="status">{copyStatus}</p>
                 )}
 
+                {researchMetadata && (
+                  <dl className="research-metadata">
+                    <div>
+                      <dt>Depth</dt>
+                      <dd>{researchMetadata.depth}</dd>
+                    </div>
+                    <div>
+                      <dt>Chunks</dt>
+                      <dd>{researchMetadata.retrievedChunkCount} retrieved · {researchMetadata.chunksSent} sent</dd>
+                    </div>
+                    <div>
+                      <dt>Evidence</dt>
+                      <dd>~{researchMetadata.evidenceTokenCount} tokens</dd>
+                    </div>
+                    <div>
+                      <dt>Alpha</dt>
+                      <dd>{researchMetadata.alpha}</dd>
+                    </div>
+                    {researchMetadata.retrievalTimeMs != null && (
+                      <div>
+                        <dt>Retrieval</dt>
+                        <dd>{researchMetadata.retrievalTimeMs} ms</dd>
+                      </div>
+                    )}
+                    {researchMetadata.timeToFirstTokenMs != null && (
+                      <div>
+                        <dt>First token</dt>
+                        <dd>{researchMetadata.timeToFirstTokenMs} ms</dd>
+                      </div>
+                    )}
+                    {researchMetadata.generationTimeMs != null && (
+                      <div>
+                        <dt>Generation</dt>
+                        <dd>{researchMetadata.generationTimeMs} ms</dd>
+                      </div>
+                    )}
+                  </dl>
+                )}
+
                 <div className="answer-text">
-                  {renderAnswerMarkdown(answer, citations, scrollToSource)}
+                  <ReactMarkdown
+                    remarkPlugins={[
+                      remarkGfm,
+                      [remarkCitations, { citationIds: citations.map((citation) => citation.id) }],
+                      [remarkClaimReferences, { claims: claimEvidence }],
+                    ]}
+                    rehypePlugins={[rehypeHighlight]}
+                    components={{
+                      a: ({ href, children, ...props }) => {
+                        const evidenceMatch = href?.match(/^#evidence-(claim_\d{2})$/)
+                        if (evidenceMatch) {
+                          return (
+                            <button
+                              type="button"
+                              className="inline-evidence-reference"
+                              onClick={() => scrollToClaimEvidence(evidenceMatch[1])}
+                              aria-label={`Open evidence for ${evidenceMatch[1].replace('_', ' ')}`}
+                            >
+                              {children}
+                            </button>
+                          )
+                        }
+                        const citationMatch = href?.match(/^#source-(\d+)$/)
+                        if (citationMatch) {
+                          const id = Number(citationMatch[1])
+                          const citation = citations.find((entry) => entry.id === id)
+                          if (citation) {
+                            return (
+                              <button
+                                type="button"
+                                className="inline-citation"
+                                onClick={() => scrollToSource(id)}
+                                title={`[Source ${id}] ${citation.title}`}
+                                aria-label={`Jump to Source ${id}`}
+                              >
+                                {children}
+                              </button>
+                            )
+                          }
+                        }
+                        return <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>
+                      },
+                    }}
+                  >
+                    {answer}
+                  </ReactMarkdown>
                 </div>
               </article>
+
+              {claimAttribution?.status === 'unavailable' && (
+                <div className="claim-attribution-notice" role="status">
+                  Claim-level evidence attribution is unavailable. The answer and existing citations are unchanged.
+                </div>
+              )}
+
+              {claimEvidence.length > 0 && (
+                <section className="claim-evidence-section" aria-labelledby="claim-evidence-title">
+                  <div className="subsection-heading">
+                    <div>
+                      <div className="results-kicker">CLAIM-LEVEL ATTRIBUTION</div>
+                      <h3 id="claim-evidence-title">Evidence for individual claims</h3>
+                    </div>
+                    <span className="source-total">
+                      {claimEvidence.length} {claimEvidence.length === 1 ? 'claim' : 'claims'}
+                    </span>
+                  </div>
+                  <p className="claim-evidence-disclaimer">
+                    Passages are drawn from retrieved text. Retrieval relevance is not proof or independent fact-checking.
+                  </p>
+                  <div className="claim-evidence-list">
+                    {claimEvidence.map((claim, index) => {
+                      const statusLabel = {
+                        direct: 'Direct support',
+                        partial: 'Partial support',
+                        related: 'Related context',
+                        unsupported: 'Unsupported',
+                      }[claim.status] || 'Unsupported'
+
+                      return (
+                        <article
+                          className={`claim-evidence-card ${openClaimId === claim.claimId ? 'claim-evidence-card-open' : ''}`}
+                          id={`claim-evidence-${claim.claimId}`}
+                          key={claim.claimId}
+                        >
+                          <button
+                            type="button"
+                            className="claim-evidence-summary"
+                            aria-expanded={openClaimId === claim.claimId}
+                            aria-controls={`claim-evidence-body-${claim.claimId}`}
+                            onClick={() => setOpenClaimId((current) => current === claim.claimId ? null : claim.claimId)}
+                          >
+                            <span className="claim-evidence-id">
+                              Claim {String(index + 1).padStart(2, '0')}
+                            </span>
+                            <span className="claim-evidence-text">{claim.claimText}</span>
+                            <span className={`claim-support-label claim-support-${claim.status}`}>
+                              {statusLabel}
+                            </span>
+                          </button>
+                          <div
+                            className="claim-evidence-body"
+                            id={`claim-evidence-body-${claim.claimId}`}
+                            aria-hidden={openClaimId !== claim.claimId}
+                            inert={openClaimId !== claim.claimId}
+                          >
+                            <div className="claim-evidence-content">
+                              {!Array.isArray(claim.evidence) || claim.evidence.length === 0 ? (
+                                <p className="claim-unsupported-message">
+                                  No retrieved passage was identified as supporting this claim.
+                                </p>
+                              ) : claim.evidence.map((item, evidenceIndex) => {
+                                const externalUrl = getSafeExternalUrl(item.url)
+                                const evidenceStatusLabel = {
+                                  direct: 'Direct support',
+                                  partial: 'Partial support',
+                                  related: 'Related context',
+                                }[item.supportStatus] || 'Unsupported'
+
+                                return (
+                                  <article className="claim-source-card" key={`${item.chunkId}-${evidenceIndex}`}>
+                                    <div className="claim-source-heading">
+                                      <span className="claim-domain-mark" aria-hidden="true">
+                                        {(item.domain || '?').slice(0, 1).toUpperCase()}
+                                      </span>
+                                      <div className="claim-source-identity">
+                                        <strong>{item.title || 'Source title unavailable'}</strong>
+                                        <span>{item.domain || 'Domain unavailable'}</span>
+                                      </div>
+                                      <span className={`claim-support-label claim-support-${item.supportStatus}`}>
+                                        {evidenceStatusLabel}
+                                      </span>
+                                    </div>
+                                    <blockquote className="claim-source-quote">
+                                      {item.extractedText}
+                                    </blockquote>
+                                    <div className="claim-source-meta">
+                                      <span>
+                                        {item.sourceId ? `[Source ${item.sourceId}] · ` : ''}
+                                        Chunk {item.chunkId}
+                                      </span>
+                                      {typeof item.relevanceScore === 'number' && (
+                                        <span>{Math.round(item.relevanceScore * 100)}% retrieval relevance</span>
+                                      )}
+                                      {externalUrl && (
+                                        <a href={externalUrl} target="_blank" rel="noreferrer">
+                                          Open source <ExternalIcon />
+                                        </a>
+                                      )}
+                                    </div>
+                                  </article>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        </article>
+                      )
+                    })}
+                  </div>
+                </section>
+              )}
 
               {citations.length > 0 && (
                 <section className="source-section" aria-labelledby="sources-title">

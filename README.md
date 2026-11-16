@@ -3,7 +3,7 @@
 VeriScope is a local-first research system that searches the web,
 extracts webpage content, retrieves relevant evidence using lexical +
 semantic search, and generates a grounded answer using a locally running
-Mistral model.
+Qwen 3.5 9B model.
 
 The current architecture is:
 
@@ -21,7 +21,7 @@ Research Pipeline
    ├── MiniLM → semantic embeddings
    ├── Hybrid retrieval
    ├── Evidence selection
-   └── Ollama + Mistral → grounded answer
+   └── Ollama + Qwen 3.5 9B → grounded answer
 ```
 
 Completed research results are stored in the browser's local IndexedDB
@@ -35,15 +35,57 @@ browser storage is not sent to the backend or synchronized across devices.
 # 1. Prerequisites
 
 The same Docker Compose project runs on macOS and Windows with Docker
-Desktop. Ollama and Mistral remain native host prerequisites; SearXNG,
+Desktop. Ollama and Qwen 3.5 9B remain native host prerequisites; SearXNG,
 the frontend, backend, and MiniLM run in Compose.
 
 You need:
 
-- Docker Desktop
+- Docker Engine (Docker Desktop on macOS/Windows)
 - Ollama installed on the host
-- The `mistral` model downloaded in Ollama
+- The `qwen3.5:9b` model downloaded in Ollama
 - Node.js, npm, and Python 3 only for native/manual development
+
+## Ubuntu/Linux startup
+
+On Ubuntu, Docker Engine can run the SearXNG and MiniLM containers while
+the frontend and backend run natively. This keeps Ollama on its default
+loopback-only listener, which containers cannot reach through
+`host.docker.internal` on Linux.
+
+Make sure Docker Engine is running and your account can access it. If you
+were just added to the `docker` group, sign out and back in, or run
+`newgrp docker` in the terminal you use below. Install Node.js 22 or
+newer and Ollama, then download the model with `ollama run qwen3.5:9b`.
+
+From the project root, create a private SearXNG secret and start the
+containerized services:
+
+```sh
+cp .env.example .env
+sed -i "s/^SEARXNG_SECRET=.*/SEARXNG_SECRET=$(openssl rand -hex 32)/" .env
+docker compose up -d --build searxng embedding
+```
+
+In one terminal, install and start the backend:
+
+```sh
+cd backend
+npm ci
+node --env-file=../.env src/server.js
+```
+
+In another terminal, install and start the frontend:
+
+```sh
+cd frontend
+npm ci
+npm run dev
+```
+
+Open **http://localhost:5173**. Keep Ollama running on the host. The
+embedding image downloads the MiniLM model on its first start and may
+take a few minutes. To stop the containerized services, run
+`docker compose down` from the project root.
 
 For a Docker-only launch, verify Docker Desktop is running:
 
@@ -136,14 +178,15 @@ ollama list
 
 ------------------------------------------------------------------------
 
-# 6. Install Mistral
+# 6. Install Qwen 3.5 9B
 
-VeriScope currently uses the `mistral` model.
+VeriScope uses the `qwen3.5:9b` model by default. You can override the
+model with the `OLLAMA_MODEL` environment variable.
 
 Download/run it:
 
 ``` bash
-ollama run mistral
+ollama run qwen3.5:9b
 ```
 
 The first run downloads the model. Verify it is installed:
@@ -157,18 +200,17 @@ ollama list
 # 7. Ollama connectivity
 
 Native backend development uses `http://localhost:11434`. A containerized
-backend uses `http://host.docker.internal:11434`, which Docker Desktop
-resolves to the host on both macOS and Windows.
+backend uses `http://host.docker.internal:11434`. Compose maps that name to
+the host gateway.
 
-If `/api/tags` works on the host but the backend container cannot connect,
-the Ollama listener may be bound only to loopback. Restart Ollama with
-`OLLAMA_HOST=0.0.0.0:11434` (macOS: `OLLAMA_HOST=0.0.0.0:11434 ollama
-serve`; Windows PowerShell: `$env:OLLAMA_HOST='0.0.0.0:11434'; ollama
-serve`). This listens on all interfaces, so only do this with the host
-firewall restricting inbound access to local Docker/host traffic. Do not
-create a public or LAN-wide inbound rule, configure router port
-forwarding, or expose Ollama to the internet. Verify host firewall and
-Docker Desktop networking before changing the listener.
+On Linux, a host Ollama service bound only to `127.0.0.1` is reachable by a
+native backend but not by a container through the Docker gateway. Keep the
+native URL as `http://localhost:11434`. For Compose, use
+`http://host.docker.internal:11434`. The Linux Compose override provides a
+small bridge-only proxy that listens on the Docker host-gateway address and
+forwards to `127.0.0.1:11434`; the Ollama service stays loopback-only. The
+proxy refuses to bind unless the address belongs to a Docker bridge interface.
+It does not change firewall rules or expose Ollama to a LAN/public interface.
 
 ------------------------------------------------------------------------
 
@@ -280,7 +322,7 @@ Hybrid retrieval
  ↓
 Evidence package
  ↓
-Mistral
+Qwen 3.5 9B
  ↓
 Answer + citations
 ```
@@ -308,16 +350,22 @@ Open that address in your browser.
 
 # 13. Run VeriScope with Docker Compose
 
-After completing section 4 and setting `SEARXNG_SECRET`, the single
-startup command builds and starts the frontend, backend, MiniLM, SearXNG,
-and Valkey:
+After completing section 4 and setting `SEARXNG_SECRET`, start the Compose
+stack. On Linux, use the additional file to enable the loopback-preserving
+Ollama bridge:
 
 ```text
-docker compose up --build
+docker compose -f compose.yaml -f compose.linux.yaml up --build -d
+```
+
+On Docker Desktop, use the standard Compose file:
+
+```text
+docker compose up --build -d
 ```
 
 Open **http://localhost:5173**. The backend API is available at
-**http://localhost:5001**. Ollama and Mistral remain native host services.
+**http://localhost:5001**. Ollama and Qwen 3.5 9B remain native host services.
 The backend waits for healthy SearXNG and MiniLM services before starting.
 
 | Service | Host address | Notes |
@@ -326,7 +374,7 @@ The backend waits for healthy SearXNG and MiniLM services before starting.
 | Backend | `http://localhost:5001` | Express API |
 | SearXNG | `http://localhost:8080` | Host port configurable with `SEARXNG_PORT`; internal address is `searxng:8080` |
 | MiniLM | `embedding:8000` | Compose-only; native development uses `http://127.0.0.1:8000` |
-| Ollama | `http://localhost:11434` | Native host service; containers reach `host.docker.internal:11434` |
+| Ollama | `http://localhost:11434` | Native host service; Linux Compose reaches it through the bridge-only proxy |
 | Valkey | `valkey:6379` | Internal SearXNG state; not published to the host |
 
 ------------------------------------------------------------------------
@@ -369,7 +417,15 @@ Windows PowerShell:
 Invoke-RestMethod http://localhost:11434/api/tags
 ```
 
-### Mistral
+Test actual model generation (not just connectivity):
+
+```sh
+curl http://localhost:11434/api/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5:9b","prompt":"Reply with exactly QWEN_OK","stream":false,"think":false,"options":{"num_predict":64,"temperature":0}}'
+```
+
+### Qwen 3.5 9B
 
 ``` bash
 ollama list
@@ -390,7 +446,20 @@ docker compose exec backend node -e "fetch('http://host.docker.internal:11434/ap
 ```
 
 The `/api/health` endpoint reports connectivity status for all three
-upstream services.
+upstream services, the configured model name, and whether it is installed.
+Ollama health uses `/api/tags` only; it does not load the model or generate
+text during frontend polling.
+
+Check Ollama's GPU offload and NVIDIA utilization:
+
+```sh
+ollama ps
+nvidia-smi
+```
+
+`ollama ps` reports the CPU/GPU split. A 9B model may use both system RAM and
+VRAM depending on available memory; do not infer full GPU residency from the
+GPU model alone.
 
 ### Backend
 
@@ -466,7 +535,7 @@ is untouched.
 # 16. Important: Why Does Research Take \~3 Minutes?
 
 A 3-minute end-to-end response on an M2 MacBook Air does NOT necessarily
-mean Mistral alone takes 3 minutes.
+mean Qwen alone takes 3 minutes.
 
 VeriScope currently performs many sequential operations:
 
@@ -493,7 +562,7 @@ VeriScope currently performs many sequential operations:
        ↓
 11. Select evidence
        ↓
-12. Send evidence to Mistral
+12. Send evidence to Qwen
        ↓
 13. Generate final answer
 ```
@@ -503,7 +572,7 @@ Several of these are currently performed sequentially.
 The Playwright fallback can also be relatively expensive because the
 current scraper opens a browser for each fallback page.
 
-Therefore, before optimizing Mistral, measure where the time is actually
+Therefore, before optimizing Qwen, measure where the time is actually
 being spent.
 
 ------------------------------------------------------------------------
@@ -514,9 +583,9 @@ Yes.
 
 Local LLM performance depends heavily on the hardware.
 
-Your M2 MacBook Air is capable of running Mistral locally, but a machine
-with a significantly faster GPU and/or more memory can generate
-responses much faster.
+Local Qwen performance depends on your hardware; a machine with a
+significantly faster GPU and/or more memory can generate responses much
+faster.
 
 The biggest differences usually come from:
 
@@ -537,7 +606,7 @@ continued improving its Apple Silicon backend, including MLX-based
 optimizations.
 
 However, **your 3-minute total time is not a good measurement of
-Mistral's raw generation speed** because the VeriScope pipeline includes
+Qwen's raw generation speed** because the VeriScope pipeline includes
 web searching, scraping, embedding, retrieval, and then generation.
 
 ------------------------------------------------------------------------
@@ -557,7 +626,7 @@ Chunking:         0.2s
 BM25:             0.1s
 Embeddings:      35.2s
 Hybrid retrieval: 0.1s
-Mistral:          95.4s
+Qwen:             95.4s
 -----------------------
 Total:           151.6s
 ```
@@ -601,7 +670,7 @@ We can improve:
 -   duplicate removal
 -   source ranking
 
-### Mistral
+### Qwen
 
 We can measure:
 
@@ -611,13 +680,13 @@ We can measure:
 -   output length
 
 We can also test another local model later and compare it against
-Mistral rather than changing the architecture immediately.
+Qwen rather than changing the architecture immediately.
 
 ------------------------------------------------------------------------
 
 # 19. Important Project Principle
 
-VeriScope is designed so that Mistral is NOT the search engine and NOT
+VeriScope is designed so that Qwen is NOT the search engine and NOT
 the source of truth.
 
 The flow is:
@@ -635,12 +704,12 @@ Local retrieval
    ↓
 Evidence
    ↓
-Mistral
+Qwen
    ↓
 Grounded answer
 ```
 
-Mistral should synthesize the evidence supplied by VeriScope rather than
+Qwen should synthesize the evidence supplied by VeriScope rather than
 independently inventing the research.
 
 This is important for the project's evidence-grounding and citation
@@ -668,7 +737,7 @@ To check persistence across a restart, use `docker compose down`, then
 
 ``` bash
 ollama list
-ollama run mistral
+ollama run qwen3.5:9b
 ollama serve
 ```
 
@@ -705,8 +774,128 @@ for:
 -   Docker Desktop for macOS and Windows
 -   SearXNG container installation
 -   Ollama
--   Ollama Mistral model
+-   Ollama Qwen 3.5 9B model
 
 The commands in this README are intended for the current VeriScope
 development setup and may need minor adjustments when dependencies or
 upstream services change.
+
+------------------------------------------------------------------------
+
+# 22. Local Ollama, context, and retrieval tuning
+
+The backend reads `OLLAMA_BASE_URL`, `OLLAMA_MODEL`,
+`OLLAMA_KEEP_ALIVE`, `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_NUM_PREDICT`,
+`OLLAMA_TEMPERATURE`, `OLLAMA_REQUEST_TIMEOUT_MS`, and
+`OLLAMA_HISTORY_TOKEN_BUDGET` from the root `.env`. The same values are
+passed into the Compose backend. `OLLAMA_URL` remains supported as a
+legacy alias for `OLLAMA_BASE_URL`. Requests set Ollama's `num_ctx`,
+`num_predict`, `temperature`, `keep_alive`, and `stream` fields; the
+existing server-sent event names and payloads are unchanged.
+
+The initial backend context is 8192 tokens and generation is capped at
+2048 tokens. Research reserves the generation and prompt/history space
+before admitting evidence. FAST, NORMAL, and MAX default to Top-K/token
+budgets of 5/2000, 10/4000, and 20/5000. These values can be changed in
+`.env` using `RESEARCH_{FAST,NORMAL,MAX}_TOP_K` and
+`RESEARCH_{FAST,NORMAL,MAX}_EVIDENCE_TOKEN_BUDGET`. BM25/MiniLM alpha
+is independent of depth: 0.3 is semantic-heavy, 0.5 balanced, and 0.7
+keyword-heavy. The browser remembers depth/alpha and conversation
+history locally in IndexedDB.
+
+`keep_alive=30m` keeps model weights and runner state loaded between
+requests; it does not retain a conversation. Each request reconstructs
+conversation context from that session's recent local history and
+references. Ollama may reuse matching prompt prefixes internally, but
+KV reuse across unrelated requests is not guaranteed and is not
+application conversation storage.
+
+## Optional native Linux systemd tuning
+
+Ollama is a separate native service; backend `.env` values do not change
+the systemd service. The following is an operator procedure, not an
+automatic project install. First inspect the effective service with
+`systemctl cat ollama.service`. Then use a systemd drop-in instead of
+editing or replacing the unit:
+
+```sh
+sudo install -d -m 0755 /etc/systemd/system/ollama.service.d
+sudo tee /etc/systemd/system/ollama.service.d/90-veriscope.conf >/dev/null <<'EOF'
+[Service]
+Environment="OLLAMA_FLASH_ATTENTION=1"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+Environment="OLLAMA_KEEP_ALIVE=30m"
+Environment="OLLAMA_NUM_PARALLEL=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_CONTEXT_LENGTH=8192"
+EOF
+```
+
+This adds a separate drop-in and does not replace the unit or its existing
+environment. Review the resulting configuration before reloading and
+restarting only the Ollama service:
+
+```sh
+systemctl cat ollama.service
+sudo systemctl daemon-reload
+sudo systemctl restart ollama.service
+```
+
+Verify the service environment and GPU allocation:
+
+```sh
+systemctl show ollama.service -p DropInPaths --value
+systemctl show ollama.service -p Environment --value |
+  tr ' ' '\n' |
+  grep -E '^OLLAMA_(FLASH_ATTENTION|KV_CACHE_TYPE|KEEP_ALIVE|NUM_PARALLEL|MAX_LOADED_MODELS|CONTEXT_LENGTH)='
+ollama ps
+nvidia-smi
+```
+
+The API's `num_ctx` request option is the application-level context
+setting; the service's `OLLAMA_CONTEXT_LENGTH` supplies the server
+default. Do not set `num_gpu` or a fixed GPU-layer count. Ollama chooses
+offload placement based on available VRAM. `ollama ps` reports the
+actual CPU/GPU split after a model is loaded. The dashboard's GPU and
+model-allocation measurements are on-demand; unavailable measurements
+remain explicitly unavailable.
+
+Flash Attention enables Ollama's quantized K/V cache. `q8_0` uses
+approximately half the memory of the default `f16` cache with little
+quality impact in typical use; `q4_0` uses less memory but can cause more
+noticeable quality loss. KV quantization is a server-wide setting.
+Reducing cache precision trades a small amount of numerical fidelity for
+more context headroom; it does not shrink model weights or guarantee the
+whole model fits in 8 GiB VRAM. With 16 GiB system RAM, leave placement
+automatic and observe actual GPU/CPU allocation.
+
+To roll back only this drop-in (the inspected unit currently has no
+existing drop-ins), remove its file and restart Ollama:
+
+```sh
+sudo rm /etc/systemd/system/ollama.service.d/90-veriscope.conf
+sudo systemctl daemon-reload
+sudo systemctl restart ollama.service
+```
+
+Do not run the rollback command if you have since added other settings to
+that drop-in; review `systemctl cat ollama.service` first. The rollback
+leaves the original unit and all other drop-ins untouched.
+
+## Monitoring and model comparison
+
+`GET /api/monitoring` gathers Ollama `/api/tags` and `/api/ps`, a
+single `nvidia-smi` snapshot, host CPU memory, and the last request's
+retrieval/generation timing. The UI refreshes this only when requested.
+Ollama does not expose a KV cache quantization field in these monitoring
+responses, so verify `OLLAMA_KV_CACHE_TYPE` in the effective service
+environment and check Ollama logs during an inference; do not infer cache
+precision from model allocation.
+
+No replacement model is selected automatically. A smaller text-only
+Qwen candidate should be compared against the installed Qwen 3.5 9B on
+the same evidence-grounded research prompts, context, quantization, and
+hardware, with citation correctness and answer quality checked alongside
+TTFT, generation time, and VRAM/RAM. A model file being smaller or
+text-only is not by itself evidence of a meaningful research-quality
+advantage. Models are never downloaded or removed by VeriScope.
