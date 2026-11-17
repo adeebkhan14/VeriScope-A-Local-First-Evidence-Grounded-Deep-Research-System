@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 
 import { createApp } from "../src/server.js";
+import { createConversationStore } from "../src/conversationStore.js";
 import { research } from "../src/research.js";
 
 let nextResearch = async (query, options) => ({ query, options });
@@ -10,6 +11,7 @@ let nextHealth = async () => ({});
 const app = createApp({
   researchFn: (...args) => nextResearch(...args),
   healthCheckFn: (...args) => nextHealth(...args),
+  conversationStore: createConversationStore({ dbPath: ":memory:" }),
 });
 let server;
 let baseUrl;

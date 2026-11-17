@@ -30,7 +30,7 @@ export const OLLAMA_KEEP_ALIVE =
   process.env.OLLAMA_KEEP_ALIVE?.trim() || "30m";
 export const OLLAMA_CONTEXT_LENGTH = positiveIntegerEnv(
   "OLLAMA_CONTEXT_LENGTH",
-  8192
+  4096
 );
 export const OLLAMA_NUM_PREDICT = positiveIntegerEnv(
   "OLLAMA_NUM_PREDICT",
@@ -42,10 +42,44 @@ export const OLLAMA_REQUEST_TIMEOUT_MS = positiveIntegerEnv(
 );
 export const OLLAMA_HISTORY_TOKEN_BUDGET = positiveIntegerEnv(
   "OLLAMA_HISTORY_TOKEN_BUDGET",
-  600
+  1600
 );
+export const OLLAMA_RECENT_EXCHANGES = positiveIntegerEnv(
+  "OLLAMA_RECENT_EXCHANGES",
+  5
+);
+export const OLLAMA_SUMMARY_THRESHOLD_MESSAGES = positiveIntegerEnv(
+  "OLLAMA_SUMMARY_THRESHOLD_MESSAGES",
+  16
+);
+export const OLLAMA_SUMMARY_MIN_NEW_MESSAGES = positiveIntegerEnv(
+  "OLLAMA_SUMMARY_MIN_NEW_MESSAGES",
+  6
+);
+export const OLLAMA_SUMMARY_TOKEN_BUDGET = positiveIntegerEnv(
+  "OLLAMA_SUMMARY_TOKEN_BUDGET",
+  500
+);
+export const OLLAMA_SUMMARY_RETRY_INTERVAL_MS = positiveIntegerEnv(
+  "OLLAMA_SUMMARY_RETRY_INTERVAL_MS",
+  300000
+);
+export const OLLAMA_HISTORICAL_EVIDENCE_TOKEN_BUDGET = positiveIntegerEnv(
+  "OLLAMA_HISTORICAL_EVIDENCE_TOKEN_BUDGET",
+  300
+);
+export const OLLAMA_MIN_OUTPUT_TOKENS = positiveIntegerEnv(
+  "OLLAMA_MIN_OUTPUT_TOKENS",
+  696
+);
+export const OLLAMA_CONTEXT_SAFETY_MARGIN = positiveIntegerEnv(
+  "OLLAMA_CONTEXT_SAFETY_MARGIN",
+  256
+);
+export const OLLAMA_DEBUG_CONTEXT =
+  process.env.VERISCOPE_DEBUG_CONTEXT === "true";
 
-const temperature = Number(process.env.OLLAMA_TEMPERATURE ?? 0.15);
+const temperature = Number(process.env.OLLAMA_TEMPERATURE ?? 0.3);
 if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
   throw new Error("OLLAMA_TEMPERATURE must be a number between 0 and 2.");
 }

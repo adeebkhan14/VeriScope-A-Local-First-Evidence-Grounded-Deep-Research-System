@@ -7,6 +7,12 @@ import ollama, {
   classifyOllamaError,
 } from "./ollamaClient.js";
 import { consumeOllamaStream } from "./ollama.js";
+import {
+  estimateMessageTokens,
+  getOutputTokenLimit,
+  logContextDiagnostics,
+} from "./contextBudget.js";
+import { estimateEvidenceTokens } from "../retrieval/depth.js";
 
 const MAX_CLAIMS = 40;
 const SUPPORT_STATUSES = new Set(["direct", "partial", "related"]);
@@ -199,20 +205,37 @@ ${JSON.stringify(input)}
   const timeoutMs =
     options.timeoutMs ??
     (Number(process.env.CLAIM_ATTRIBUTION_TIMEOUT_MS) || 15000);
+  const messages = [{ role: "user", content: prompt }];
   const startedAt = Date.now();
   try {
+    const promptTokenCount = estimateMessageTokens(messages);
+    const numPredict = getOutputTokenLimit(promptTokenCount, {
+      maxOutputTokens: Math.min(1000, OLLAMA_NUM_PREDICT),
+      minimumOutputTokens: Math.min(250, OLLAMA_NUM_PREDICT),
+    });
+    logContextDiagnostics(options.conversationId, {
+      inferenceType: "claim-attribution",
+      historicalMessagesAvailable: 0,
+      messagesSelected: 0,
+      summaryUsed: false,
+      estimatedPromptTokens: promptTokenCount,
+      evidenceTokenAllocation: estimateEvidenceTokens(sources),
+      numCtx: OLLAMA_CONTEXT_LENGTH,
+      outputTokenLimit: numPredict,
+      truncationOccurred: false,
+    });
     const response = await chatWithTimeout(
       client,
       {
         model: OLLAMA_MODEL,
         think: false,
         format: "json",
-        messages: [{ role: "user", content: prompt }],
+        messages,
         keep_alive: OLLAMA_KEEP_ALIVE,
         stream: true,
         options: {
           num_ctx: OLLAMA_CONTEXT_LENGTH,
-          num_predict: Math.min(1000, OLLAMA_NUM_PREDICT),
+          num_predict: numPredict,
           temperature: 0,
         },
       },

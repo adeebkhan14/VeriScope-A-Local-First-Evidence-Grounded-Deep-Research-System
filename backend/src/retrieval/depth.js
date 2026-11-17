@@ -58,7 +58,15 @@ export function normalizeResearchSettings({
 }
 
 export function estimateTokenCount(text) {
-  return Math.ceil((typeof text === "string" ? text.length : 0) / 4);
+  if (typeof text !== "string" || !text) return 0;
+  let asciiCharacters = 0;
+  let nonAsciiCharacters = 0;
+  for (const character of text) {
+    if (character.codePointAt(0) <= 0x7f) asciiCharacters += 1;
+    else nonAsciiCharacters += 1;
+  }
+  // This deliberately overestimates typical English text; it is not a model tokenizer.
+  return Math.ceil(asciiCharacters / 3.5 + nonAsciiCharacters);
 }
 
 export function formatEvidenceForPrompt(evidence) {

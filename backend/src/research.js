@@ -10,21 +10,32 @@ import {
   deduplicateChunks,
   diversifySources,
 } from "./retrieval/deduplicate.js";
-import { generateAnswer, tryDirectAnswer } from "./llm/ollama.js";
+import {
+  classifyResearchNeed,
+  generateAnswer,
+  tryDirectAnswer,
+} from "./llm/ollama.js";
 import { evaluateEvidenceSufficiency } from "./llm/evidenceJudge.js";
 import { attributeClaims } from "./llm/evidenceAttribution.js";
+import { routeResearchQuery } from "./llm/researchRouting.js";
 import {
   buildConversationContext,
+  fitConversationContext,
+  updateConversationSummary,
 } from "./llm/conversationContext.js";
 import {
+  OLLAMA_CONTEXT_SAFETY_MARGIN,
   OLLAMA_CONTEXT_LENGTH,
   OLLAMA_HISTORY_TOKEN_BUDGET,
   OLLAMA_NUM_PREDICT,
 } from "./llm/ollamaClient.js";
-import { buildGroundedAnswerPrompt } from "./llm/ollama.js";
+import { buildGroundedAnswerMessages } from "./llm/ollama.js";
+import {
+  estimateMessageTokens,
+  getPromptTokenBudget,
+} from "./llm/contextBudget.js";
 import {
   estimateEvidenceTokens,
-  estimateTokenCount,
   normalizeResearchSettings,
   selectEvidenceWithinBudget,
 } from "./retrieval/depth.js";
@@ -35,15 +46,16 @@ const MAX_EMBEDDING_CANDIDATES = 20;
 
 /**
  * Main research pipeline:
- * 0. Direct answer evaluation via the local Ollama model (for non-knowledge-intensive / internal-knowledge queries)
- * 1. Web search & URL deduplication via SearXNG (for knowledge-intensive / real-time queries)
- * 2. Parallel scraping with search-snippet fallback for inaccessible pages
- * 3. Text chunking & near-duplicate chunk suppression
- * 4. BM25 lexical retrieval
- * 5. MiniLM semantic embeddings with graceful lexical fallback
- * 6. Hybrid scoring & source diversification
- * 7. Evidence packaging with supporting excerpts for every citation
- * 8. Factual synthesis via the local Ollama model with insufficient-evidence detection
+ * 0. Deterministic conversation/research routing, with local-model classification as fallback
+ * 1. Reuse relevant prior evidence through the existing sufficiency and citation checks
+ * 2. Web search & URL deduplication via SearXNG (for knowledge-intensive / real-time queries)
+ * 3. Parallel scraping with search-snippet fallback for inaccessible pages
+ * 4. Text chunking & near-duplicate chunk suppression
+ * 5. BM25 lexical retrieval
+ * 6. MiniLM semantic embeddings with graceful lexical fallback
+ * 7. Hybrid scoring & source diversification
+ * 8. Evidence packaging with supporting excerpts for every citation
+ * 9. Factual synthesis via the local Ollama model with insufficient-evidence detection
  *
  * @param {string} query
  * @param {{ forceWebSearch?: boolean }} [options]
@@ -73,7 +85,7 @@ const MAX_EMBEDDING_CANDIDATES = 20;
  *   insufficientEvidence: boolean,
  *   llmUnavailable?: boolean,
  *   llmError?: { status: string, code: string, message: string },
- *   source?: "local_llm" | "web_search",
+ *   source?: "local_llm" | "web_search" | "existing_evidence" | "clarification",
  *   answeredByLLM?: boolean,
  *   searchedWeb?: boolean,
  *   warnings?: string[]
@@ -107,25 +119,90 @@ export async function research(query, options = {}) {
     onProgress,
     onToken,
   } = options;
+  query = query.trim();
+  const sessionId =
+    typeof options.sessionId === "string" ? options.sessionId : null;
+  if (options.signal?.aborted) {
+    const error = new Error("Research request was cancelled.");
+    error.name = "AbortError";
+    error.code = "ABORT_ERR";
+    throw error;
+  }
+  let route = routeResearchQuery(query, {
+    conversation: options.conversation,
+    forceWebSearch,
+  });
+  if (route.category === "ambiguous") {
+    return {
+      query,
+      sessionId,
+      answer: route.clarification,
+      citations: [],
+      evidence: [],
+      insufficientEvidence: false,
+      source: "clarification",
+      answeredByLLM: false,
+      searchedWeb: false,
+      researchMetadata: {
+        routeCategory: route.category,
+        historicalMessagesAvailable: Array.isArray(options.conversation)
+          ? options.conversation.length
+          : 0,
+      },
+    };
+  }
   const researchSettings = normalizeResearchSettings({
     depth: options.depth,
     alpha: options.alpha,
   });
-  const conversation = buildConversationContext(options.conversation, {
+
+  let conversationSummary = "";
+  if (options.conversationStore && sessionId) {
+    try {
+      const summaryResult = await updateConversationSummary({
+        store: options.conversationStore,
+        conversationId: sessionId,
+        messages: options.conversation,
+        ollamaClient,
+        signal: options.signal,
+      });
+      conversationSummary = summaryResult.summary;
+    } catch (error) {
+      if (options.signal?.aborted || error?.name === "AbortError") throw error;
+      console.warn("[Context] Stored conversation summary unavailable.", {
+        conversationId: sessionId,
+        code: error?.code || "SUMMARY_READ_FAILED",
+      });
+    }
+  }
+
+  const rawConversation = buildConversationContext(options.conversation, {
+    summary: conversationSummary,
+    currentQuestion: query.trim(),
     tokenBudget: OLLAMA_HISTORY_TOKEN_BUDGET,
   });
-  const promptOverheadTokens = estimateTokenCount(
-    buildGroundedAnswerPrompt(query.trim(), [], conversation.prompt)
-  );
+  const groundedPrompt = buildGroundedAnswerMessages(query.trim(), [], []);
+  const conversation = fitConversationContext(rawConversation, {
+    systemMessage: groundedPrompt[0],
+    currentMessage: groundedPrompt.at(-1),
+    maxPromptTokens: getPromptTokenBudget(),
+  });
+  const historyTokenCount = rawConversation.tokenCount;
+  const promptOverheadTokens = estimateMessageTokens(conversation.messages);
+  if (promptOverheadTokens > getPromptTokenBudget()) {
+    const error = new Error(
+      `The question and required instructions exceed the safe ${OLLAMA_CONTEXT_LENGTH}-token context budget. Shorten the question and try again.`
+    );
+    error.code = "CONTEXT_BUDGET_EXCEEDED";
+    throw error;
+  }
   const effectiveEvidenceTokenBudget = Math.max(
     0,
     Math.min(
       researchSettings.evidenceTokenBudget,
-      OLLAMA_CONTEXT_LENGTH - OLLAMA_NUM_PREDICT - promptOverheadTokens
+      getPromptTokenBudget() - promptOverheadTokens
     )
   );
-  const sessionId =
-    typeof options.sessionId === "string" ? options.sessionId : null;
   const createResearchMetadata = ({
     retrievedChunkCount = 0,
     chunksSent = 0,
@@ -133,7 +210,9 @@ export async function research(query, options = {}) {
     retrievalTimeMs = null,
     timeToFirstTokenMs = null,
     generationTimeMs = null,
+    contextDiagnostics = null,
   } = {}) => ({
+    routeCategory: route.category,
     depth: researchSettings.depth,
     alpha: researchSettings.alpha,
     topK: researchSettings.topK,
@@ -143,40 +222,219 @@ export async function research(query, options = {}) {
     chunksSent,
     evidenceTokenCount,
     contextLength: OLLAMA_CONTEXT_LENGTH,
-    conversationTokens: conversation.tokenCount,
-    conversationMessages: conversation.messagesIncluded,
+    conversationTokens: historyTokenCount,
+    conversationMessages:
+      contextDiagnostics?.messagesSelected ?? conversation.messagesIncluded,
     summarizedConversationMessages: conversation.summarizedMessages,
+    summaryUsed:
+      contextDiagnostics?.summaryUsed ?? conversation.summaryUsed,
+    historicalEvidenceReferences: conversation.evidenceReferencesIncluded,
+    contextTruncated:
+      contextDiagnostics?.truncationOccurred ?? conversation.truncated,
+    estimatedPromptTokens:
+      contextDiagnostics?.estimatedPromptTokens ??
+      promptOverheadTokens + evidenceTokenCount,
+    outputTokenLimit:
+      contextDiagnostics?.outputTokenLimit ??
+      Math.max(
+        0,
+        Math.min(
+          OLLAMA_NUM_PREDICT,
+          OLLAMA_CONTEXT_LENGTH -
+            OLLAMA_CONTEXT_SAFETY_MARGIN -
+            promptOverheadTokens -
+            evidenceTokenCount
+        )
+      ),
     retrievalTimeMs,
     timeToFirstTokenMs,
     generationTimeMs,
   });
   const reportProgress = (message) => onProgress?.(message);
-  const warnings = [];
+  const warnings = Array.isArray(options.routingWarnings)
+    ? [...options.routingWarnings]
+    : [];
 
-  if (options.signal?.aborted) {
-    const error = new Error("Research request was cancelled.");
-    error.name = "AbortError";
-    error.code = "ABORT_ERR";
-    throw error;
+  if (route.category === "model_decision") {
+    const classification = await classifyResearchNeed(query, {
+      ollamaClient,
+      signal: options.signal,
+      contextGroups: conversation,
+      conversationId: sessionId,
+    });
+    route = {
+      ...route,
+      category: classification.category,
+      reason: classification.reason,
+    };
+    if (classification.llmError) {
+      warnings.push(classification.llmError.message);
+    } else if (classification.classificationUnavailable) {
+      warnings.push(
+        "Routing classification was unclear; web research was selected conservatively."
+      );
+    }
   }
 
   console.log("\n========================================");
   console.log("STARTING RESEARCH / QUERY EVALUATION");
   console.log("========================================");
-  query = query.trim();
-  console.log("Query:", query);
+  if (process.env.NODE_ENV === "production") {
+    console.log("Query length:", query.length);
+  } else {
+    console.log("Query:", query);
+  }
+
+  if (route.category === "existing_evidence") {
+    reportProgress("Checking previous research evidence...");
+    const reusedEvidence = selectEvidenceWithinBudget(
+      route.evidence,
+      researchSettings.topK,
+      effectiveEvidenceTokenBudget
+    );
+    if (reusedEvidence.length === 0) {
+      route = {
+        ...route,
+        category: "new_research",
+        reason: "Stored evidence did not fit the safe prompt budget.",
+      };
+      warnings.push(
+        "Previous research evidence could not fit the context budget; fresh research was started."
+      );
+    } else {
+      const reusedEvidenceTokenCount = estimateEvidenceTokens(reusedEvidence);
+      const evaluation = await evaluateEvidenceSufficiency(
+        query,
+        reusedEvidence,
+        {
+          ollamaClient,
+          timeoutMs: judgeTimeoutMs,
+          signal: options.signal,
+          conversationId: sessionId,
+          queryContext: route.sourceQuestion,
+        }
+      );
+      const citations = reusedEvidence.map((source) => ({
+        id: source.id,
+        title: source.title,
+        url: source.url,
+        snippet: source.text,
+        score: source.score,
+      }));
+      const reuseMetadata = createResearchMetadata({
+        retrievedChunkCount: route.evidence.length,
+        chunksSent: reusedEvidence.length,
+        evidenceTokenCount: reusedEvidenceTokenCount,
+      });
+
+      if (evaluation.status === "insufficient") {
+        route = {
+          ...route,
+          category: "new_research",
+          reason: "The evidence gate found the stored passages insufficient.",
+        };
+        warnings.push(
+          "Previous research evidence was insufficient for this follow-up; fresh research was started."
+        );
+      } else if (!evaluation.sufficient) {
+        return {
+          query,
+          sessionId,
+          answer:
+            "Not enough evidence. Evidence verification could not be completed at this time.",
+          citations,
+          evidence: reusedEvidence,
+          insufficientEvidence: true,
+          evidenceStatus: "verification_failed",
+          evidenceEvaluation: evaluation,
+          missingEvidence: evaluation.missing || evaluation.reason,
+          source: "existing_evidence",
+          answeredByLLM: false,
+          searchedWeb: false,
+          researchMetadata: reuseMetadata,
+        };
+      } else {
+        const responseMode = "existing_evidence";
+        reportProgress("Generating answer from previous research...");
+        const generation = await generateAnswer(query, reusedEvidence, {
+          ollamaClient,
+          onToken,
+          signal: options.signal,
+          contextGroups: conversation,
+          conversationId: sessionId,
+        });
+        let claimAttribution;
+        if (!generation.llmUnavailable && !generation.isInsufficientEvidence) {
+          reportProgress("Mapping claims to evidence...");
+          claimAttribution = await attributeClaims(
+            generation.answer,
+            reusedEvidence,
+            { ollamaClient, signal: options.signal, conversationId: sessionId }
+          );
+          if (claimAttribution.status === "unavailable") {
+            warnings.push(
+              "Claim-level evidence attribution was unavailable; the answer and source citations are unchanged."
+            );
+          }
+        }
+        return {
+          query,
+          sessionId,
+          answer: generation.answer,
+          citations,
+          evidence: reusedEvidence,
+          claimAttribution,
+          insufficientEvidence: generation.isInsufficientEvidence || false,
+          llmUnavailable: generation.llmUnavailable || false,
+          llmError: generation.llmError,
+          evidenceStatus: generation.isInsufficientEvidence
+            ? "insufficient"
+            : "sufficient",
+          evidenceEvaluation: evaluation,
+          missingEvidence: generation.isInsufficientEvidence
+            ? "Generation detected remaining gaps in the stored evidence."
+            : null,
+          source: responseMode,
+          answeredByLLM: false,
+          searchedWeb: false,
+          warnings: warnings.length > 0 ? warnings : undefined,
+          researchMetadata: {
+            ...reuseMetadata,
+            timeToFirstTokenMs:
+              generation.timing?.timeToFirstTokenMs ?? null,
+            generationTimeMs: generation.timing?.generationTimeMs ?? null,
+            estimatedPromptTokens:
+              generation.contextDiagnostics?.estimatedPromptTokens ??
+              reuseMetadata.estimatedPromptTokens,
+            outputTokenLimit:
+              generation.contextDiagnostics?.outputTokenLimit ??
+              reuseMetadata.outputTokenLimit,
+          },
+        };
+      }
+    }
+  }
 
   // ========================================
   // 0. DIRECT ANSWER EVALUATION (Local Ollama model)
   // ========================================
-  if (!forceWebSearch) {
-    reportProgress("Checking local model...");
-    console.log("\n[0] Checking if the local model can answer directly...");
+  if (
+    route.category === "local_knowledge" ||
+    route.category === "conversation_only"
+  ) {
+    const responseMode = route.category;
+    const conversationOnly = responseMode === "conversation_only";
+    if (!conversationOnly) {
+      console.log("\n[0] Local answer route finalized.");
+    }
     let directAnswerStarted = false;
     const directResult = await tryDirectAnswer(query, {
       ollamaClient,
       signal: options.signal,
-      conversationContext: conversation.prompt,
+      contextGroups: conversation,
+      conversationId: sessionId,
+      conversationOnly,
+      answerOnly: responseMode === "local_knowledge",
       onToken: (token) => {
         if (!directAnswerStarted) {
           reportProgress("Generating answer...");
@@ -188,7 +446,7 @@ export async function research(query, options = {}) {
 
     if (directResult.canAnswer && directResult.answer) {
       console.log(
-        "✓ Answered directly by the local model (internal knowledge / less knowledge-intensive)"
+        "✓ Answered directly by the local model (internal knowledge / conversation context)"
       );
       return {
         query,
@@ -204,32 +462,43 @@ export async function research(query, options = {}) {
         researchMetadata: createResearchMetadata({
           timeToFirstTokenMs: directResult.timing?.timeToFirstTokenMs ?? null,
           generationTimeMs: directResult.timing?.generationTimeMs ?? null,
+          contextDiagnostics: directResult.contextDiagnostics,
         }),
       };
     }
 
-    if (directResult.llmUnavailable) {
-      warnings.push(
+    if (responseMode === "conversation_only" || responseMode === "local_knowledge") {
+      const error = new Error(
         directResult.llmError?.message ||
-          "Ollama could not evaluate a direct answer; proceeding with web search."
+          directResult.reason ||
+          "The local model could not complete this local-only response."
       );
+      error.code =
+        directResult.llmError?.code === "OLLAMA_TIMEOUT"
+          ? "TIMEOUT"
+          : directResult.llmError?.status === "offline"
+            ? "SERVICE_UNAVAILABLE"
+            : "UPSTREAM_ERROR";
+      error.service = "Ollama";
+      throw error;
     }
-
-    console.log(
-      `Web search required: ${
-        directResult.reason || "Knowledge-intensive or external facts required"
-      }`
-    );
-  } else {
-    console.log("\n[0] Web search explicitly requested (forceWebSearch = true)");
   }
+
+  const responseMode = route.category;
+  if (responseMode !== "new_research") {
+    throw new Error(`Unsupported finalized research route: ${responseMode}`);
+  }
+  console.log(
+    `\n[0] Research route finalized: ${responseMode} (${route.reason})`
+  );
+  const retrievalQuery = route.searchQuery || query;
 
   // ========================================
   // 1. SEARCH WITH SEARXNG (Deduplicated URLs)
   // ========================================
   reportProgress("Querying SearXNG...");
   console.log("\n[1] Searching with SearXNG...");
-  const searchResults = await discoverFn(query);
+  const searchResults = await discoverFn(retrievalQuery);
   console.log(`Found ${searchResults.length} unique search results`);
 
   if (searchResults.length === 0) {
@@ -252,7 +521,7 @@ export async function research(query, options = {}) {
       source: "web_search",
       answeredByLLM: false,
       searchedWeb: true,
-      warnings: ["SearXNG returned no search results."],
+      warnings: [...warnings, "SearXNG returned no search results."],
       researchMetadata: createResearchMetadata(),
     };
   }
@@ -415,7 +684,7 @@ export async function research(query, options = {}) {
   const retrievalStartedAt = Date.now();
   console.log("\n[4] Building BM25 index & scoring...");
   const bm25Index = createBM25Index(chunks);
-  const bm25Results = bm25Index.search(query, chunks.length);
+  const bm25Results = bm25Index.search(retrievalQuery, chunks.length);
 
   const bm25Scores = new Map(
     bm25Results.map((result) => [result.id, result.bm25Score])
@@ -435,7 +704,7 @@ export async function research(query, options = {}) {
   reportProgress("Reranking with MiniLM...");
   console.log("\n[5] Embedding candidate chunks...");
   const embeddingResponse = await embeddingsFn([
-    query,
+    retrievalQuery,
     ...candidates.map((chunk) => chunk.text),
   ]);
 
@@ -538,6 +807,8 @@ export async function research(query, options = {}) {
       ollamaClient,
       timeoutMs: judgeTimeoutMs,
       signal: options.signal,
+      conversationId: sessionId,
+      queryContext: route.sourceQuestion,
     }
   );
 
@@ -596,7 +867,8 @@ export async function research(query, options = {}) {
       ollamaClient,
       onToken,
       signal: options.signal,
-      conversationContext: conversation.prompt,
+      contextGroups: conversation,
+      conversationId: sessionId,
     }
   );
 
@@ -607,7 +879,7 @@ export async function research(query, options = {}) {
     claimAttribution = await attributeClaims(
       generation.answer,
       evidencePackage.evidence,
-      { ollamaClient, signal: options.signal }
+      { ollamaClient, signal: options.signal, conversationId: sessionId }
     );
     if (claimAttribution.status === "unavailable") {
       resultWarnings.push(
@@ -642,6 +914,21 @@ export async function research(query, options = {}) {
     warnings: resultWarnings.length > 0 ? resultWarnings : undefined,
     researchMetadata: {
       ...researchMetadata,
+      conversationMessages:
+        generation.contextDiagnostics?.messagesSelected ??
+        researchMetadata.conversationMessages,
+      summaryUsed:
+        generation.contextDiagnostics?.summaryUsed ??
+        researchMetadata.summaryUsed,
+      contextTruncated:
+        generation.contextDiagnostics?.truncationOccurred ??
+        researchMetadata.contextTruncated,
+      estimatedPromptTokens:
+        generation.contextDiagnostics?.estimatedPromptTokens ??
+        researchMetadata.estimatedPromptTokens,
+      outputTokenLimit:
+        generation.contextDiagnostics?.outputTokenLimit ??
+        researchMetadata.outputTokenLimit,
       timeToFirstTokenMs: generation.timing?.timeToFirstTokenMs ?? null,
       generationTimeMs: generation.timing?.generationTimeMs ?? null,
     },

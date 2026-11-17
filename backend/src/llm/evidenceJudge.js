@@ -7,6 +7,12 @@ import ollama, {
   classifyOllamaError,
 } from "./ollamaClient.js";
 import { consumeOllamaStream } from "./ollama.js";
+import {
+  estimateMessageTokens,
+  getOutputTokenLimit,
+  logContextDiagnostics,
+} from "./contextBudget.js";
+import { estimateEvidenceTokens } from "../retrieval/depth.js";
 
 /**
  * Builds the strict evidence-sufficiency prompt for the local model.
@@ -16,7 +22,7 @@ import { consumeOllamaStream } from "./ollama.js";
  * @param {Array<{id: number, title: string, url: string, text: string}>} evidence
  * @returns {string}
  */
-export function buildEvidenceJudgePrompt(query, evidence) {
+export function buildEvidenceJudgePrompt(query, evidence, queryContext = "") {
   const passagesText = evidence
     .map((item) => {
       const id = item?.id ?? "?";
@@ -53,6 +59,9 @@ You must respond with ONLY a valid JSON object (no markdown formatting, no text 
 
 User Query:
 ${query}
+${typeof queryContext === "string" && queryContext.trim()
+    ? `\nPrior research question context (for resolving references only; it is not an additional request):\n${queryContext.trim()}`
+    : ""}
 
 Retrieved Passages:
 ${passagesText}`;
@@ -210,28 +219,44 @@ export async function evaluateEvidenceSufficiency(query, evidence, options = {})
     options.timeoutMs ??
     (Number(process.env.EVIDENCE_JUDGE_TIMEOUT_MS) || 60000);
 
-  const prompt = buildEvidenceJudgePrompt(normalizedQuery, safeEvidence);
+  const prompt = buildEvidenceJudgePrompt(
+    normalizedQuery,
+    safeEvidence,
+    options.queryContext
+  );
+  const promptMessages = [{ role: "user", content: prompt }];
   const startedAt = Date.now();
 
   try {
+    const promptTokenCount = estimateMessageTokens(promptMessages);
+    const numPredict = getOutputTokenLimit(promptTokenCount, {
+      maxOutputTokens: Math.min(250, OLLAMA_NUM_PREDICT),
+      minimumOutputTokens: Math.min(250, OLLAMA_NUM_PREDICT),
+    });
+    logContextDiagnostics(options.conversationId, {
+      inferenceType: "evidence-sufficiency",
+      historicalMessagesAvailable: 0,
+      messagesSelected: 0,
+      summaryUsed: false,
+      estimatedPromptTokens: promptTokenCount,
+      evidenceTokenAllocation: estimateEvidenceTokens(safeEvidence),
+      numCtx: OLLAMA_CONTEXT_LENGTH,
+      outputTokenLimit: numPredict,
+      truncationOccurred: false,
+    });
     const response = await chatWithTimeout(
       client,
       {
         model,
         think: false,
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
+        messages: promptMessages,
         format: "json",
         keep_alive: OLLAMA_KEEP_ALIVE,
         stream: true,
         options: {
           num_ctx: OLLAMA_CONTEXT_LENGTH,
           temperature: 0.0,
-          num_predict: Math.min(250, OLLAMA_NUM_PREDICT),
+          num_predict: numPredict,
         },
       },
       { signal: options.signal, timeoutMs }

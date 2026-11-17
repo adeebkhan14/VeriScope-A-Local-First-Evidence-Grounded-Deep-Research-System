@@ -76,6 +76,21 @@ describe("Research depth and context budgets", () => {
     assert.match(context.prompt, /Message 9/);
   });
 
+  it("rejects a current question that cannot fit before starting web research", async () => {
+    let searchStarted = false;
+    await assert.rejects(
+      research("oversized question ".repeat(3000), {
+        forceWebSearch: true,
+        discoverFn: async () => {
+          searchStarted = true;
+          return [];
+        },
+      }),
+      { code: "CONTEXT_BUDGET_EXCEEDED" }
+    );
+    assert.equal(searchStarted, false);
+  });
+
   it("applies each Top-K through hybrid retrieval and respects evidence budgets", async () => {
     const pages = Array.from({ length: 5 }, (_, pageIndex) => {
       let content = "";
@@ -130,6 +145,9 @@ describe("Research depth and context budgets", () => {
       assert.ok(chunksSent <= topK);
       assert.ok(evidenceTokenCount <= evidenceTokenBudget);
     }
-    assert.ok(results[2].researchMetadata.chunksSent > 10);
+    assert.ok(
+      results[2].researchMetadata.evidenceTokenCount <=
+        results[2].researchMetadata.effectiveEvidenceTokenBudget
+    );
   });
 });

@@ -2,13 +2,22 @@ import ollama, {
   OLLAMA_CONTEXT_LENGTH,
   OLLAMA_KEEP_ALIVE,
   OLLAMA_MODEL,
-  OLLAMA_NUM_PREDICT,
   OLLAMA_REQUEST_TIMEOUT_MS,
   OLLAMA_TEMPERATURE,
   chatWithTimeout,
   classifyOllamaError,
 } from "./ollamaClient.js";
 import { formatEvidenceForPrompt } from "../retrieval/depth.js";
+import {
+  buildConversationContext,
+  fitConversationContext,
+} from "./conversationContext.js";
+import {
+  estimateMessageTokens,
+  getOutputTokenLimit,
+  getPromptTokenBudget,
+  logContextDiagnostics,
+} from "./contextBudget.js";
 
 function normalizeContent(value) {
   if (typeof value === "string") return value;
@@ -135,6 +144,29 @@ ${evidenceText}
 `;
 }
 
+export function buildGroundedAnswerMessages(query, evidence, conversationMessages) {
+  const systemPrompt = `You are a rigorous, factual research assistant.
+
+Answer the user's question using ONLY the evidence passages provided in the current user message.
+
+Strict Rules:
+1. Ground every claim directly in the current evidence. Prior conversation is for resolving references and continuity only; it is not evidence.
+2. Every factual statement must cite its exact source using [Source N] format (e.g., [Source 1], [Source 2]).
+3. If the current evidence does NOT contain enough facts to answer the question, state:
+"Based on the retrieved sources, there is insufficient evidence to answer this question."
+Then describe what information is present and what is missing. Never produce a confident guess.
+4. Keep the answer clear, objective, and structured.`;
+  const evidenceText = formatEvidenceForPrompt(evidence);
+  return [
+    { role: "system", content: systemPrompt },
+    ...conversationMessages,
+    {
+      role: "user",
+      content: `User Question:\n${query}\n\nEvidence:\n${evidenceText}`,
+    },
+  ];
+}
+
 /**
  * Checks if the generated response indicates insufficient evidence.
  *
@@ -218,6 +250,112 @@ export function validateAndSanitizeCitations(answer, validEvidenceIds) {
   };
 }
 
+export async function classifyResearchNeed(query, options = {}) {
+  const normalizedQuery = typeof query === "string" ? query.trim() : "";
+  if (!normalizedQuery) {
+    return {
+      category: "new_research",
+      reason: "An empty question cannot be classified for local answering.",
+    };
+  }
+
+  const client = options.ollamaClient || ollama;
+  const context = options.contextGroups?.groups
+    ? options.contextGroups
+    : buildConversationContext(options.conversationMessages, {
+        summary:
+          typeof options.conversationContext === "string"
+            ? options.conversationContext
+            : "",
+        currentQuestion: normalizedQuery,
+      });
+  const systemMessage = {
+    role: "system",
+    content: `Classify whether the user question can be answered safely using stable, general knowledge, or whether fresh web research is required. Do not answer the question.
+
+Choose WEB_RESEARCH for current, recent, time-sensitive, leadership/employment status, market, software version/release/availability, source verification, or uncertain specific factual questions. Choose LOCAL_KNOWLEDGE for stable concepts, programming explanations, ordinary conversation, and well-established facts.
+
+Prior conversation is context only and is not verified evidence. Return exactly one label: LOCAL_KNOWLEDGE or WEB_RESEARCH.`,
+  };
+  const fittedContext = fitConversationContext(context, {
+    systemMessage,
+    currentMessage: { role: "user", content: normalizedQuery },
+    maxPromptTokens: getPromptTokenBudget(),
+  });
+  const promptTokenCount = estimateMessageTokens(fittedContext.messages);
+  const outputTokenLimit = getOutputTokenLimit(promptTokenCount, {
+    maxOutputTokens: 24,
+    minimumOutputTokens: 1,
+  });
+  logContextDiagnostics(options.conversationId, {
+    inferenceType: "route-classifier",
+    historicalMessagesAvailable: fittedContext.availableMessages,
+    messagesSelected: fittedContext.messagesIncluded,
+    summaryUsed: fittedContext.summaryUsed,
+    estimatedPromptTokens: promptTokenCount,
+    evidenceTokenAllocation: 0,
+    numCtx: OLLAMA_CONTEXT_LENGTH,
+    outputTokenLimit,
+    truncationOccurred: fittedContext.truncated,
+  });
+
+  try {
+    const response = await chatWithTimeout(
+      client,
+      {
+        model: OLLAMA_MODEL,
+        think: false,
+        messages: fittedContext.messages,
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        stream: false,
+        options: {
+          num_ctx: OLLAMA_CONTEXT_LENGTH,
+          num_predict: outputTokenLimit,
+          temperature: 0,
+        },
+      },
+      {
+        signal: options.signal,
+        timeoutMs: options.timeoutMs ?? OLLAMA_REQUEST_TIMEOUT_MS,
+      }
+    );
+    const classification = normalizeContent(
+      response?.message?.content ?? response?.content ?? ""
+    )
+      .trim()
+      .toUpperCase();
+
+    if (classification === "LOCAL_KNOWLEDGE") {
+      return {
+        category: "local_knowledge",
+        reason: "The local model classified the question as stable knowledge.",
+      };
+    }
+
+    return {
+      category: "new_research",
+      reason:
+        classification === "WEB_RESEARCH"
+          ? "The local model classified the question as requiring fresh research."
+          : "The routing classification was unclear; defaulting to web research.",
+      classificationUnavailable: classification !== "WEB_RESEARCH",
+    };
+  } catch (error) {
+    if (options.signal?.aborted || error?.name === "AbortError") throw error;
+    if (error?.code === "CONTEXT_BUDGET_EXCEEDED") throw error;
+    const llmError = classifyOllamaError(error);
+    console.warn("[ResearchRouting] Classifier unavailable; using web research.", {
+      code: llmError.code,
+    });
+    return {
+      category: "new_research",
+      reason: "Local routing classification was unavailable; using web research.",
+      classificationUnavailable: true,
+      llmError,
+    };
+  }
+}
+
 /**
  * Generates an evidence-grounded answer using the configured local Ollama model.
  *
@@ -255,6 +393,69 @@ export async function generateAnswer(query, evidence, options = {}) {
     })),
     options.conversationContext
   );
+  const context = options.contextGroups?.groups
+    ? options.contextGroups
+    : buildConversationContext(options.conversationMessages, {
+        summary:
+          typeof options.conversationContext === "string"
+            ? options.conversationContext
+            : "",
+        currentQuestion: query,
+      });
+  const systemMessage = {
+    role: "system",
+    content: `You are a rigorous, factual research assistant.
+
+Answer the user's question using ONLY the evidence passages provided in the current user message.
+
+Strict Rules:
+1. Ground every claim directly in the current evidence. Prior conversation is for resolving references and continuity only; it is not evidence.
+2. Every factual statement must cite its exact source using [Source N] format (e.g., [Source 1], [Source 2]).
+3. If the current evidence does NOT contain enough facts to answer the question, state:
+"Based on the retrieved sources, there is insufficient evidence to answer this question."
+Then describe what information is present and what is missing. Never produce a confident guess.
+4. Keep the answer clear, objective, and structured.`,
+  };
+  const currentMessage = {
+    role: "user",
+    content: `User Question:\n${query}\n\nEvidence:\n${formatEvidenceForPrompt(
+      safeEvidence.map((item) => ({
+        ...item,
+        text:
+          normalizeContent(item?.text) ||
+          "No supporting text was provided.",
+      }))
+    )}`,
+  };
+  const hasContext = context.groups.some((group) => group.messages.length > 0);
+  const fittedContext = fitConversationContext(context, {
+    systemMessage: hasContext ? systemMessage : null,
+    currentMessage: hasContext
+      ? currentMessage
+      : { role: "user", content: prompt },
+    maxPromptTokens: getPromptTokenBudget(),
+  });
+  const messages = hasContext
+    ? fittedContext.messages
+    : [{ role: "user", content: prompt }];
+  const promptTokenCount = estimateMessageTokens(messages);
+  const numPredict = getOutputTokenLimit(promptTokenCount);
+  const evidenceTokenCount = estimateMessageTokens([
+    { role: "user", content: formatEvidenceForPrompt(safeEvidence) },
+  ]);
+  const contextDiagnostics = {
+    inferenceType: "grounded-answer",
+    historicalMessagesAvailable: fittedContext.availableMessages,
+    messagesSelected: fittedContext.messagesIncluded,
+    summaryUsed: fittedContext.summaryUsed,
+    evidenceReferencesIncluded: fittedContext.evidenceReferencesIncluded,
+    estimatedPromptTokens: promptTokenCount,
+    evidenceTokenAllocation: evidenceTokenCount,
+    numCtx: OLLAMA_CONTEXT_LENGTH,
+    outputTokenLimit: numPredict,
+    truncationOccurred: fittedContext.truncated,
+  };
+  logContextDiagnostics(options.conversationId, contextDiagnostics);
 
   const generationStartedAt = Date.now();
   try {
@@ -265,17 +466,12 @@ export async function generateAnswer(query, evidence, options = {}) {
       {
         model: OLLAMA_MODEL,
         think: false,
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
+        messages,
         keep_alive: OLLAMA_KEEP_ALIVE,
         stream: true,
         options: {
           num_ctx: OLLAMA_CONTEXT_LENGTH,
-          num_predict: OLLAMA_NUM_PREDICT,
+          num_predict: numPredict,
           temperature: OLLAMA_TEMPERATURE,
         },
       },
@@ -323,9 +519,11 @@ export async function generateAnswer(query, evidence, options = {}) {
         timeToFirstTokenMs: firstTokenMs,
         generationTimeMs: Date.now() - generationStartedAt,
       },
+      contextDiagnostics,
     };
   } catch (error) {
     if (options.signal?.aborted) throw error;
+    if (error?.code === "CONTEXT_BUDGET_EXCEEDED") throw error;
     const errorMessage = getErrorMessage(error);
     console.error("Ollama synthesis notice:", errorMessage);
     const llmError = classifyOllamaError(error);
@@ -361,7 +559,15 @@ export async function tryDirectAnswer(query, options = {}) {
 
   const client = options.ollamaClient || ollama;
 
-  const prompt = `You are a knowledgeable AI assistant.
+  const conversationOnly = options.conversationOnly === true;
+  const answerOnly = conversationOnly || options.answerOnly === true;
+  const instructions = conversationOnly
+    ? `You are a conversation assistant. Answer only by explaining, rephrasing, or transforming information already present in the conversation.
+
+Do not introduce new factual claims or treat prior assistant answers as verified evidence. If the requested reference is still unclear, ask one concise clarification question.`
+    : answerOnly
+      ? `You are a knowledgeable assistant. Answer the user's question using stable, established knowledge. Do not classify the route, request web research, or output a routing label. If the answer depends on current information you cannot verify, say so plainly instead of guessing.`
+    : `You are a knowledgeable AI assistant.
 
 Analyze the user's query and decide whether you can provide a reliable, complete, and accurate answer directly from your existing internal knowledge, OR if an up-to-date web search is needed.
 
@@ -381,6 +587,17 @@ INSTRUCTIONS:
 SEARCH_REQUIRED: <brief explanation of what recent or specific information is needed>
 
 - If you ALREADY HAVE the data and can answer accurately and thoroughly without web search, provide your direct, helpful, and comprehensive answer now. Do NOT include "SEARCH_REQUIRED".
+`;
+  const context = options.contextGroups?.groups
+    ? options.contextGroups
+    : buildConversationContext(options.conversationMessages, {
+        summary:
+          typeof options.conversationContext === "string"
+            ? options.conversationContext
+            : "",
+        currentQuestion: normalizedQuery,
+      });
+  const prompt = `${instructions}
 
 User Query:
 ${normalizedQuery}
@@ -392,22 +609,53 @@ ${options.conversationContext
   try {
     const streamTokens = typeof options.onToken === "function";
     const timeoutMs = options.timeoutMs ?? OLLAMA_REQUEST_TIMEOUT_MS;
+    const systemMessage = {
+      role: "system",
+      content:
+        conversationOnly
+          ? `${instructions}\nUse the prior conversation only as the material to transform.`
+          : answerOnly
+            ? `${instructions}\nThe response mode is already fixed to local knowledge. Do not switch modes.`
+          : `${instructions}\nPrior conversation is for continuity and reference resolution only; it is not evidence for factual claims.`,
+    };
+    const currentMessage = { role: "user", content: normalizedQuery };
+    const hasContext = context.groups.some((group) => group.messages.length > 0);
+    const fittedContext = fitConversationContext(context, {
+      systemMessage: hasContext ? systemMessage : null,
+      currentMessage: hasContext
+        ? currentMessage
+        : { role: "user", content: prompt },
+      maxPromptTokens: getPromptTokenBudget(),
+    });
+    const messages = hasContext
+      ? fittedContext.messages
+      : [{ role: "user", content: prompt }];
+    const promptTokenCount = estimateMessageTokens(messages);
+    const numPredict = getOutputTokenLimit(promptTokenCount);
+    const contextDiagnostics = {
+      inferenceType: "direct-answer",
+      historicalMessagesAvailable: fittedContext.availableMessages,
+      messagesSelected: fittedContext.messagesIncluded,
+      summaryUsed: fittedContext.summaryUsed,
+      evidenceReferencesIncluded: fittedContext.evidenceReferencesIncluded,
+      estimatedPromptTokens: promptTokenCount,
+      evidenceTokenAllocation: 0,
+      numCtx: OLLAMA_CONTEXT_LENGTH,
+      outputTokenLimit: numPredict,
+      truncationOccurred: fittedContext.truncated,
+    };
+    logContextDiagnostics(options.conversationId, contextDiagnostics);
     const response = await chatWithTimeout(
       client,
       {
         model: OLLAMA_MODEL,
         think: false,
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
+        messages,
         keep_alive: OLLAMA_KEEP_ALIVE,
         stream: true,
         options: {
           num_ctx: OLLAMA_CONTEXT_LENGTH,
-          num_predict: OLLAMA_NUM_PREDICT,
+          num_predict: numPredict,
           temperature: OLLAMA_TEMPERATURE,
         },
       },
@@ -434,6 +682,10 @@ ${options.conversationContext
         timeoutMs: Math.max(1, timeoutMs - (Date.now() - generationStartedAt)),
         startedAt: generationStartedAt,
         onToken: (token) => {
+          if (answerOnly) {
+            emitDirectToken(token);
+            return;
+          }
           if (directMarkerHandled || searchRequired) {
             if (!searchRequired) emitDirectToken(token);
             return;
@@ -497,7 +749,7 @@ ${options.conversationContext
     }
 
     // Check if the response explicitly requests a search
-    if (/search_(?:required|needed)/i.test(content)) {
+    if (!answerOnly && /search_(?:required|needed)/i.test(content)) {
       const match = content.match(/search_(?:required|needed)[:\s]*(.*)/i);
       const reason =
         match && match[1]?.trim()
@@ -532,9 +784,9 @@ ${options.conversationContext
       "i don't know the answer",
     ];
 
-    const hasUncertainty = uncertaintyPatterns.some((pattern) =>
-      lower.includes(pattern)
-    );
+    const hasUncertainty =
+      !answerOnly &&
+      uncertaintyPatterns.some((pattern) => lower.includes(pattern));
     if (hasUncertainty) {
       return {
         canAnswer: false,
@@ -554,9 +806,11 @@ ${options.conversationContext
       canAnswer: true,
       answer: cleanedAnswer,
       timing,
+      contextDiagnostics,
     };
   } catch (error) {
     if (options.signal?.aborted) throw error;
+    if (error?.code === "CONTEXT_BUDGET_EXCEEDED") throw error;
     const errorMessage = getErrorMessage(error);
     console.warn("Ollama direct answer evaluation notice:", errorMessage);
     const llmError = classifyOllamaError(error);

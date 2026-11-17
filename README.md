@@ -786,29 +786,72 @@ upstream services change.
 
 The backend reads `OLLAMA_BASE_URL`, `OLLAMA_MODEL`,
 `OLLAMA_KEEP_ALIVE`, `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_NUM_PREDICT`,
-`OLLAMA_TEMPERATURE`, `OLLAMA_REQUEST_TIMEOUT_MS`, and
-`OLLAMA_HISTORY_TOKEN_BUDGET` from the root `.env`. The same values are
-passed into the Compose backend. `OLLAMA_URL` remains supported as a
-legacy alias for `OLLAMA_BASE_URL`. Requests set Ollama's `num_ctx`,
-`num_predict`, `temperature`, `keep_alive`, and `stream` fields; the
-existing server-sent event names and payloads are unchanged.
+`OLLAMA_TEMPERATURE`, `OLLAMA_REQUEST_TIMEOUT_MS`, and the `OLLAMA_*`
+context-management values in the root `.env`. `OLLAMA_URL` remains
+supported as a legacy alias for `OLLAMA_BASE_URL`. The Compose default
+for `OLLAMA_CONTEXT_LENGTH` is 4096; it is not raised automatically.
+Requests preserve the configured model, temperature, and keep-alive and
+set Ollama's `num_ctx`, `num_predict`, and `stream` fields.
 
-The initial backend context is 8192 tokens and generation is capped at
-2048 tokens. Research reserves the generation and prompt/history space
-before admitting evidence. FAST, NORMAL, and MAX default to Top-K/token
-budgets of 5/2000, 10/4000, and 20/5000. These values can be changed in
-`.env` using `RESEARCH_{FAST,NORMAL,MAX}_TOP_K` and
+The initial context is 4096 tokens, the maximum generation setting is
+2048 tokens, the minimum output reserve is 696 tokens, and a 256-token
+safety margin is held back. The request's `num_predict` is reduced when
+the estimated prompt needs more room. Research reduces its evidence
+budget before omitting the current question or core instructions. FAST,
+NORMAL, and MAX default to Top-K/token budgets of 5/2000, 10/4000, and
+20/5000. These values can be changed in `.env` using
+`RESEARCH_{FAST,NORMAL,MAX}_TOP_K` and
 `RESEARCH_{FAST,NORMAL,MAX}_EVIDENCE_TOKEN_BUDGET`. BM25/MiniLM alpha
 is independent of depth: 0.3 is semantic-heavy, 0.5 balanced, and 0.7
-keyword-heavy. The browser remembers depth/alpha and conversation
-history locally in IndexedDB.
+keyword-heavy. The browser remembers depth/alpha and completed research
+results locally in IndexedDB; conversation messages are persisted by the
+backend in SQLite.
 
-`keep_alive=30m` keeps model weights and runner state loaded between
-requests; it does not retain a conversation. Each request reconstructs
-conversation context from that session's recent local history and
-references. Ollama may reuse matching prompt prefixes internally, but
-KV reuse across unrelated requests is not guaranteed and is not
-application conversation storage.
+Context selection keeps up to five recent complete exchanges within
+`OLLAMA_HISTORY_TOKEN_BUDGET` (1600 tokens by default), in chronological
+order. Failed or incomplete exchanges are omitted. Older completed turns
+are summarized with the configured local Ollama model when the history
+exceeds `OLLAMA_SUMMARY_THRESHOLD_MESSAGES` (16 messages by default).
+Summaries update incrementally after at least
+`OLLAMA_SUMMARY_MIN_NEW_MESSAGES` (6) new older messages; they are stored
+in SQLite and never replace original messages. Failed summary attempts
+fall back to bounded recent context and are retried after
+`OLLAMA_SUMMARY_RETRY_INTERVAL_MS`.
+
+Stored excerpts added to ordinary conversation context retain their
+original source/chunk IDs but are explicitly marked as unverified
+continuity context. For factual follow-ups, deterministic routing can
+select the original passages saved with one earlier research answer;
+those passages keep their original IDs and must pass the same
+evidence-sufficiency gate and citation verification as newly retrieved
+evidence. If they are insufficient, the existing SearXNG retrieval
+pipeline runs. A stored summary or assistant answer is never authoritative
+evidence.
+
+Simple rephrasing and clarification requests use conversation context
+without web search. Queries that explicitly request current information or
+fresh verification go directly to web research. Leadership and employment
+status changes, market prices/metrics, and software version or availability
+questions also require fresh research. Stable explanations, programming
+questions, and ordinary conversation use local knowledge. Ambiguous
+references with no conversation antecedent receive a clarification prompt.
+Only unresolved requests use a non-streaming local route classifier. The
+route is finalized before answer generation starts; local answers and
+evidence-backed answers cannot switch modes after their first token.
+
+No model tokenizer dependency is used. Token counts are conservative
+estimates based on text characters plus per-message overhead, with a
+safety margin; they are not exact Qwen token counts, especially for code,
+URLs, and non-English text. The 4096 context setting should be benchmarked
+on the target hardware before changing it. `keep_alive=30m` keeps model
+weights and runner state loaded between requests; it does not retain a
+conversation.
+
+In development, set `VERISCOPE_DEBUG_CONTEXT=true` for counts-only
+diagnostics: conversation ID, available/selected messages, summary use,
+estimated prompt/evidence tokens, `num_ctx`, output limit, and truncation.
+It is disabled by default and never logs message contents. The existing
+streaming research endpoint and SSE event names remain unchanged.
 
 ## Optional native Linux systemd tuning
 
@@ -827,7 +870,7 @@ Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
 Environment="OLLAMA_KEEP_ALIVE=30m"
 Environment="OLLAMA_NUM_PARALLEL=1"
 Environment="OLLAMA_MAX_LOADED_MODELS=1"
-Environment="OLLAMA_CONTEXT_LENGTH=8192"
+Environment="OLLAMA_CONTEXT_LENGTH=4096"
 EOF
 ```
 
