@@ -2,11 +2,32 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#09090d" />
-    <meta name="description" content="VeriScope — a clearer way to explore the open web." />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#171717" media="(prefers-color-scheme: dark)" />
+    <meta name="description" content="VeriScope — local-first, evidence-grounded research. Follow the evidence." />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>VeriScope — Find your signal</title>
+    <title>VeriScope</title>
+    <!--
+      Resolve the saved theme before first paint so the page never flashes the
+      wrong colours. Keep the storage key in sync with src/hooks/useTheme.js.
+    -->
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('veriscope-theme')
+          var dark =
+            saved === 'dark' ||
+            (saved !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          var root = document.documentElement
+          root.dataset.theme = dark ? 'dark' : 'light'
+          root.style.colorScheme = dark ? 'dark' : 'light'
+        } catch (error) {
+          /* storage unavailable: fall back to the stylesheet defaults */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

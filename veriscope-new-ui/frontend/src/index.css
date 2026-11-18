@@ -1,0 +1,244 @@
+/*
+  VeriScope design tokens, reset and base typography.
+  Source of truth: Design.md §10 (colour), §11 (typography), §13 (themes).
+  Components must use these variables and never hard-code colours.
+*/
+
+:root {
+  --font-sans: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+
+  /* Light theme (default until the theme script runs) */
+  --bg: #ffffff;
+  --bg-sidebar: #f7f7f7;
+  --text: #171717;
+  --text-2: #737373;
+  --border: #e5e5e5;
+  --card: #fafafa;
+  --hover: #f0f0f0;
+
+  /* Derived neutrals */
+  --active: #e8e8e8;
+  --border-strong: #cfcfcf;
+  --user-bg: #f3f3f3;
+  --inverse-bg: #171717;
+  --inverse-text: #ffffff;
+  --ring: rgba(23, 23, 23, 0.1);
+  --scrim: rgba(0, 0, 0, 0.32);
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.08);
+
+  /* Meaningful status colours only */
+  --warn: #9a6700;
+  --danger: #b42318;
+
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  --content-w: 850px;
+  --sidebar-w: 260px;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+:root[data-theme='dark'] {
+  --bg: #171717;
+  --bg-sidebar: #202020;
+  --text: #f5f5f5;
+  --text-2: #a1a1aa;
+  --border: #333333;
+  --card: #222222;
+  --hover: #2b2b2b;
+
+  --active: #333333;
+  --border-strong: #4a4a4a;
+  --user-bg: #262626;
+  --inverse-bg: #f5f5f5;
+  --inverse-text: #171717;
+  --ring: rgba(245, 245, 245, 0.14);
+  --scrim: rgba(0, 0, 0, 0.55);
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.45);
+
+  --warn: #d9a441;
+  --danger: #f2867d;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  height: 100%;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  height: 100%;
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100%;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--active);
+}
+
+/* Thin, neutral scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Shared button primitives */
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  color: var(--text-2);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  transition: background-color 0.15s var(--ease), color 0.15s var(--ease);
+}
+
+.icon-btn:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 14px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  transition: background-color 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+
+.btn:hover {
+  background: var(--hover);
+}
+
+.btn-danger {
+  color: var(--inverse-text);
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+.btn-danger:hover {
+  background: var(--danger);
+  filter: brightness(0.94);
+}
+
+/* Popover surface shared by Settings and the composer's alpha control */
+.popover {
+  position: absolute;
+  z-index: 30;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-pop);
+  animation: popover-in 0.12s var(--ease);
+}
+
+@keyframes popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* Applied briefly by useTheme so a theme switch fades instead of snapping */
+.theme-anim,
+.theme-anim *,
+.theme-anim *::before,
+.theme-anim *::after {
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease, fill 0.2s ease !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

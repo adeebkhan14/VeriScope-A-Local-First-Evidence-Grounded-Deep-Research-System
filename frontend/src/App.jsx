@@ -1,8 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import rehypeHighlight from 'rehype-highlight'
-import VeriscopeSymbol from './VeriscopeSymbol'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   deleteConversation as deleteConversationRequest,
   getConversation,
@@ -10,1197 +6,503 @@ import {
   sendConversationMessage,
   startConversationResearch,
 } from './conversationApi'
+import { AssistantMessage, UserMessage } from './components/Message'
+import Composer from './components/Composer'
+import ConfirmDialog from './components/ConfirmDialog'
+import Sidebar from './components/Sidebar'
+import StatusLine from './components/StatusLine'
+import { ArrowDownIcon, PanelLeftIcon } from './components/icons'
+import { useHealth } from './hooks/useHealth'
+import { useMediaQuery } from './hooks/useMediaQuery'
+import { usePersistentState } from './hooks/usePersistentState'
+import { useTheme } from './hooks/useTheme'
+import { conversationTitle, createId, sortConversations } from './lib/format'
 import {
-  addResearchResult,
-  clearResearchHistory,
-  deleteResearchResult,
-  getResearchHistory,
-  setResearchSaved,
-} from './researchHistory'
+  DEFAULT_ALPHA,
+  DEFAULT_DEPTH,
+  describeProgress,
+  isValidAlpha,
+  isValidDepth,
+} from './lib/research'
+import { readResearchStream } from './lib/stream'
 import './App.css'
-import 'highlight.js/styles/github-dark.css'
 
-const suggestions = [
-  'how does Kubernetes perform service discovery?',
-  'how does LLM search work?',
-  'what is BM25 retrieval?',
-]
+const ACTIVE_SESSION_KEY = 'veriscope-active-session'
+const STICK_THRESHOLD = 120
 
-function getInitialTheme() {
+function readStoredSession() {
   try {
-    return globalThis.localStorage.getItem('veriscope-theme') === 'light' ? 'light' : 'dark'
-  } catch {
-    return 'dark'
-  }
-}
-
-function getInitialPreference(key, allowedValues, fallback) {
-  try {
-    const value = globalThis.localStorage.getItem(key)
-    return allowedValues.includes(value) ? value : fallback
-  } catch {
-    return fallback
-  }
-}
-
-function getInitialSessionId() {
-  try {
-    return globalThis.localStorage.getItem('veriscope-active-session') || null
+    return globalThis.localStorage.getItem(ACTIVE_SESSION_KEY) || null
   } catch {
     return null
   }
 }
 
-function createResultId() {
-  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
-}
-
-function formatResearchDate(value) {
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'Date unavailable'
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  }).format(date)
-}
-
-function getDomain(url) {
+function writeStoredSession(id) {
   try {
-    return new URL(url).hostname.replace(/^www\./, '')
+    if (id) globalThis.localStorage.setItem(ACTIVE_SESSION_KEY, id)
+    else globalThis.localStorage.removeItem(ACTIVE_SESSION_KEY)
   } catch {
-    return 'Web source'
+    // storage unavailable: restoring the last conversation is a convenience only
   }
 }
 
-function getSafeExternalUrl(url) {
-  try {
-    const parsed = new URL(url)
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : null
-  } catch {
-    return null
-  }
+/** A message restored from the database can never still be streaming: the request that owned it is gone. */
+function normalizeRestoredMessage(message) {
+  if (message.status !== 'streaming') return message
+  return { ...message, status: 'failed', content: message.content || '', error: 'This research was interrupted before it finished.' }
 }
 
-function SearchIcon({ size = 18 }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <circle cx="10.8" cy="10.8" r="6.8" stroke="currentColor" strokeWidth="1.7" />
-      <path d="m16 16 4.2 4.2" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  )
+function errorText(error, fallback) {
+  return error instanceof Error && error.message ? error.message : fallback
 }
 
-function GlobeIcon({ size = 16 }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <circle cx="12" cy="12" r="8" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M4 12h16M12 4a14.5 14.5 0 0 1 0 16M12 4a14.5 14.5 0 0 0 0 16" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-    </svg>
-  )
-}
+export default function App() {
+  const [theme, setTheme] = useTheme()
+  const health = useHealth()
+  const isDesktop = useMediaQuery('(min-width: 768px)')
 
-function ThemeIcon({ theme }) {
-  return theme === 'dark' ? (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <circle cx="12" cy="12" r="4" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ) : (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M20.5 15.2A8.5 8.5 0 0 1 8.8 3.5 8.5 8.5 0 1 0 20.5 15.2Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
+  // Composer preferences. New keys: the old ones stored bare strings in a different format.
+  const [depth, setDepth] = usePersistentState('veriscope-depth-v2', DEFAULT_DEPTH, isValidDepth)
+  const [alpha, setAlpha] = usePersistentState('veriscope-alpha-v2', DEFAULT_ALPHA, isValidAlpha)
+  const [forceWeb, setForceWeb] = useState(false)
+  const [query, setQuery] = useState('')
 
-function ArrowIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
-function CopyIcon({ size = 14 }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <rect x="9" y="9" width="10" height="10" rx="2" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M5 15V7a2 2 0 0 1 2-2h8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  )
-}
-
-function PlusIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  )
-}
-
-function ChevronDownIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
-function remarkCitations({ citationIds = [] } = {}) {
-  const knownIds = new Set(citationIds)
-  const pattern = /\[(?:Source\s*)?(\d+(?:\s*,\s*(?:Source\s*)?\d+)*)\]/gi
-
-  return (tree) => {
-    function transform(node) {
-      if (!Array.isArray(node.children)) return
-
-      node.children = node.children.flatMap((child) => {
-        if (child.type !== 'text') {
-          transform(child)
-          return [child]
-        }
-
-        const parts = []
-        let lastIndex = 0
-        let match
-        pattern.lastIndex = 0
-
-        while ((match = pattern.exec(child.value)) !== null) {
-          if (match.index > lastIndex) {
-            parts.push({ type: 'text', value: child.value.slice(lastIndex, match.index) })
-          }
-
-          const ids = match[1].match(/\d+/g).map(Number)
-          ids.forEach((id, index) => {
-            if (index > 0) parts.push({ type: 'text', value: ', ' })
-            if (knownIds.has(id)) {
-              parts.push({
-                type: 'link',
-                url: `#source-${id}`,
-                children: [{ type: 'text', value: `[Source ${id}]` }],
-              })
-            } else {
-              parts.push({ type: 'text', value: `[Source ${id}]` })
-            }
-          })
-          lastIndex = match.index + match[0].length
-        }
-
-        if (lastIndex === 0) return [child]
-        if (lastIndex < child.value.length) {
-          parts.push({ type: 'text', value: child.value.slice(lastIndex) })
-        }
-        return parts
-      })
-    }
-
-    transform(tree)
-  }
-}
-
-function Sidebar({
-  conversations,
-  activeConversationId,
-  conversationSearch,
-  setConversationSearch,
-  onSelectConversation,
-  onDeleteConversation,
-  onNewResearch,
-  onClose,
-  theme,
-  onToggleTheme,
-  isOpen,
-}) {
-  const groups = [
-    {
-      label: 'Today',
-      items: conversations.filter((conversation) => {
-        const timestamp = new Date(conversation.updatedAt || conversation.updated_at || Date.now()).getTime()
-        return Number.isFinite(timestamp) && Date.now() - timestamp < 24 * 60 * 60 * 1000
-      }),
-    },
-    {
-      label: 'Yesterday',
-      items: conversations.filter((conversation) => {
-        const timestamp = new Date(conversation.updatedAt || conversation.updated_at || Date.now()).getTime()
-        return Number.isFinite(timestamp) && Date.now() - timestamp >= 24 * 60 * 60 * 1000 && Date.now() - timestamp < 48 * 60 * 60 * 1000
-      }),
-    },
-    {
-      label: 'Previous 7 Days',
-      items: conversations.filter((conversation) => {
-        const timestamp = new Date(conversation.updatedAt || conversation.updated_at || Date.now()).getTime()
-        return Number.isFinite(timestamp) && Date.now() - timestamp >= 48 * 60 * 60 * 1000 && Date.now() - timestamp < 7 * 24 * 60 * 60 * 1000
-      }),
-    },
-    {
-      label: 'Older',
-      items: conversations.filter((conversation) => {
-        const timestamp = new Date(conversation.updatedAt || conversation.updated_at || Date.now()).getTime()
-        return Number.isFinite(timestamp) && Date.now() - timestamp >= 7 * 24 * 60 * 60 * 1000
-      }),
-    },
-  ].filter((group) => group.items.length > 0)
-
-  return (
-    <aside className={isOpen ? 'sidebar is-open' : 'sidebar'}>
-      <div className="sidebar-header">
-        <div className="brand-mark">
-          <VeriscopeSymbol />
-          <div>
-            <strong>VeriScope</strong>
-            <span>Follow the evidence.</span>
-          </div>
-        </div>
-        <button type="button" className="icon-button sidebar-close" onClick={onClose} aria-label="Close sidebar">
-          ×
-        </button>
-      </div>
-
-      <button type="button" className="primary-button sidebar-new" onClick={onNewResearch}>
-        <PlusIcon />
-        <span>New Research</span>
-      </button>
-
-      <label className="sidebar-search" aria-label="Search conversations">
-        <SearchIcon size={15} />
-        <input
-          type="search"
-          value={conversationSearch}
-          onChange={(event) => setConversationSearch(event.target.value)}
-          placeholder="Search history"
-        />
-      </label>
-
-      <div className="sidebar-list">
-        {groups.length === 0 ? (
-          <div className="sidebar-empty">No conversations yet</div>
-        ) : (
-          groups.map((group) => (
-            <section className="sidebar-group" key={group.label}>
-              <h3>{group.label}</h3>
-              <ul>
-                {group.items
-                  .filter((conversation) => {
-                    const query = conversationSearch.trim().toLowerCase()
-                    return !query || `${conversation.title || 'Untitled conversation'} ${conversation.updatedAt || conversation.updated_at || ''}`.toLowerCase().includes(query)
-                  })
-                  .map((conversation) => (
-                    <li key={conversation.id} className={conversation.id === activeConversationId ? 'is-selected' : ''}>
-                      <button type="button" className="conversation-item" onClick={() => onSelectConversation(conversation.id)}>
-                        <span>{conversation.title || 'Untitled conversation'}</span>
-                        <time dateTime={conversation.updatedAt || conversation.updated_at}>
-                          {formatResearchDate(conversation.updatedAt || conversation.updated_at)}
-                        </time>
-                      </button>
-                      <button type="button" className="conversation-delete" onClick={() => onDeleteConversation(conversation)} aria-label={`Delete ${conversation.title || 'Untitled conversation'}`}>
-                        Delete
-                      </button>
-                    </li>
-                  ))}
-              </ul>
-            </section>
-          ))
-        )}
-      </div>
-
-      <div className="sidebar-footer">
-        <button type="button" className="settings-button" onClick={onToggleTheme}>
-          <ThemeIcon theme={theme} />
-          <span>{theme === 'dark' ? 'Light mode' : 'Dark mode'}</span>
-        </button>
-      </div>
-    </aside>
-  )
-}
-
-function ChatComposer({
-  query,
-  setQuery,
-  onSubmit,
-  isLoading,
-  researchDepth,
-  setResearchDepth,
-  hybridAlpha,
-  setHybridAlpha,
-  forceWebSearch,
-  setForceWebSearch,
-}) {
-  const textareaRef = useRef(null)
-
-  useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto'
-      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 160)}px`
-    }
-  }, [query])
-
-  const handleKeyDown = (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault()
-      onSubmit(event)
-    }
-  }
-
-  return (
-    <form className="composer" onSubmit={onSubmit}>
-      <div className="composer-input-row">
-        <textarea
-          ref={textareaRef}
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="What would you like to research?"
-          rows={1}
-        />
-        <button type="submit" className="primary-button send-button" disabled={!query.trim() || isLoading}>
-          <span>{isLoading ? 'Researching' : 'Send'}</span>
-          <ArrowIcon />
-        </button>
-      </div>
-
-      <div className="composer-controls">
-        <div className="mode-selector" role="group" aria-label="Research mode">
-          {['FAST', 'NORMAL', 'MAX'].map((mode) => (
-            <button
-              key={mode}
-              type="button"
-              className={researchDepth === mode ? 'mode-button is-active' : 'mode-button'}
-              onClick={() => setResearchDepth(mode)}
-              aria-pressed={researchDepth === mode}
-            >
-              {mode === 'FAST' ? 'Fast' : mode === 'NORMAL' ? 'Normal' : 'Max'}
-            </button>
-          ))}
-        </div>
-
-        <details className="alpha-details">
-          <summary>
-            <span>Alpha</span>
-            <strong>{hybridAlpha}</strong>
-          </summary>
-          <div className="alpha-popover">
-            <div className="alpha-scale">
-              <span>Keyword</span>
-              <span>Semantic</span>
-            </div>
-            <input
-              type="range"
-              min="0.1"
-              max="0.9"
-              step="0.1"
-              value={hybridAlpha}
-              onChange={(event) => setHybridAlpha(event.target.value)}
-              aria-label="Retrieval alpha"
-            />
-            <div className="alpha-readout">{hybridAlpha}</div>
-          </div>
-        </details>
-
-        <button
-          type="button"
-          className={forceWebSearch ? 'web-toggle is-enabled' : 'web-toggle'}
-          onClick={() => setForceWebSearch((current) => !current)}
-          aria-pressed={forceWebSearch}
-        >
-          <GlobeIcon size={14} />
-          <span>{forceWebSearch ? 'Web forced' : 'Web search'}</span>
-        </button>
-      </div>
-    </form>
-  )
-}
-
-function UserMessage({ message }) {
-  return (
-    <div className="message-row message-row-user">
-      <div className="message-bubble user-bubble">
-        <div className="message-meta"><span>You</span></div>
-        <div className="message-content user-content">{message.content}</div>
-      </div>
-    </div>
-  )
-}
-
-function AssistantMessage({ message, citations, evidence, onOpenSource, activeSourceId }) {
-  const sourceIds = Array.from(new Set((citations || []).map((citation) => Number(citation.id)).filter(Number.isInteger)))
-
-  return (
-    <div className="message-row message-row-assistant">
-      <div className="message-bubble assistant-bubble">
-        <div className="message-meta"><span>VeriScope</span></div>
-        <div className="message-content assistant-content">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, [remarkCitations, { citationIds: sourceIds }]]}
-            rehypePlugins={[rehypeHighlight]}
-            components={{
-              a: ({ href, children, ...props }) => {
-                const citationMatch = href?.match(/^#source-(\d+)$/)
-                if (citationMatch) {
-                  const sourceId = Number(citationMatch[1])
-                  const citation = citations.find((item) => Number(item.id) === sourceId)
-                  if (citation) {
-                    return (
-                      <button
-                        type="button"
-                        className={activeSourceId === sourceId ? 'inline-citation is-active' : 'inline-citation'}
-                        onClick={() => onOpenSource(sourceId)}
-                        {...props}
-                      >
-                        {children}
-                      </button>
-                    )
-                  }
-                }
-
-                const safeUrl = getSafeExternalUrl(href)
-                if (safeUrl) {
-                  return (
-                    <a href={safeUrl} target="_blank" rel="noreferrer" {...props}>
-                      {children}
-                    </a>
-                  )
-                }
-                return <>{children}</>
-              },
-              code({ className, children, ...props }) {
-                const codeString = String(children).replace(/\n$/, '')
-                const isInline = !className
-                if (isInline) return <code className="inline-code" {...props}>{children}</code>
-
-                return (
-                  <pre className="code-block">
-                    <div className="code-toolbar">
-                      <span>{className?.replace('language-', '') || 'code'}</span>
-                      <button
-                        type="button"
-                        className="copy-code-button"
-                        onClick={() => navigator.clipboard?.writeText(codeString)}
-                      >
-                        <CopyIcon size={12} />
-                        Copy
-                      </button>
-                    </div>
-                    <code className={className} {...props}>{children}</code>
-                  </pre>
-                )
-              },
-              table: ({ children }) => <div className="table-wrap"><table>{children}</table></div>,
-              th: ({ children, ...props }) => <th {...props}>{children}</th>,
-              td: ({ children, ...props }) => <td {...props}>{children}</td>,
-            }}
-          >
-            {message.content}
-          </ReactMarkdown>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function EvidenceSection({ citations, evidence, activeSourceId, onOpenSource }) {
-  const cards = citations.length > 0 ? citations : evidence
-
-  if (cards.length === 0) return null
-
-  return (
-    <div className="evidence-section">
-      <div className="section-label">Evidence</div>
-      <div className="evidence-list">
-        {cards.map((item) => {
-          const sourceId = Number.isInteger(item?.id) ? item.id : null
-          const itemUrl = getSafeExternalUrl(item?.url || item?.link)
-          const isOpen = activeSourceId === sourceId
-
-          return (
-            <article
-              key={sourceId ?? `${item.title}-${item.url}`}
-              className={isOpen ? 'evidence-card is-open' : 'evidence-card'}
-              id={sourceId ? `source-${sourceId}` : undefined}
-            >
-              <button type="button" className="evidence-header" onClick={() => sourceId && onOpenSource(sourceId)}>
-                <div className="evidence-title-wrap">
-                  <span className="evidence-number">{sourceId ? `Evidence ${sourceId}` : 'Evidence'}</span>
-                  <strong>{item.title || getDomain(item.url)}</strong>
-                </div>
-                <div className="evidence-meta">
-                  <span>{getDomain(item.url || item.link || '')}</span>
-                  {typeof item.score === 'number' && <span>{Math.round(item.score * 100)}% relevance</span>}
-                </div>
-              </button>
-
-              <div className="evidence-body">
-                <p>{item.snippet || item.text || 'No supporting excerpt was returned for this source.'}</p>
-                {itemUrl && (
-                  <a href={itemUrl} target="_blank" rel="noreferrer">
-                    Open source
-                  </a>
-                )}
-              </div>
-            </article>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function MessageList({ messages, citations, evidence, onOpenSource, activeSourceId, hasActiveConversation, isLoading, progressStatus }) {
-  return (
-    <div className="message-list">
-      <div className="message-list-inner">
-        {messages.map((message) => {
-          if (message.role === 'user') return <UserMessage key={message.id} message={message} />
-          return (
-            <AssistantMessage
-              key={message.id}
-              message={message}
-              citations={citations}
-              evidence={evidence}
-              onOpenSource={onOpenSource}
-              activeSourceId={activeSourceId}
-            />
-          )
-        })}
-
-        {isLoading && progressStatus && (
-          <div className="loading-state" role="status">
-            <span className="loading-dot" />
-            <span>{progressStatus}</span>
-          </div>
-        )}
-      </div>
-
-      {citations.length > 0 || evidence.length > 0 ? (
-        <div className="evidence-panel">
-          <EvidenceSection
-            citations={citations}
-            evidence={evidence}
-            activeSourceId={activeSourceId}
-            onOpenSource={onOpenSource}
-          />
-        </div>
-      ) : null}
-    </div>
-  )
-}
-
-function LandingScreen({ onFocusInput }) {
-  return (
-    <div className="landing-screen">
-      <div className="landing-content">
-        <div className="landing-brand">
-          <VeriscopeSymbol />
-        </div>
-        <h1>VeriScope</h1>
-        <p>Follow the evidence.</p>
-      </div>
-      <button type="button" className="landing-anchor" onClick={onFocusInput}>
-        Start a research question
-      </button>
-    </div>
-  )
-}
-
-function App() {
-  const [theme, setTheme] = useState(getInitialTheme)
-  const [researchDepth, setResearchDepth] = useState(() => getInitialPreference('veriscope-research-depth', ['FAST', 'NORMAL', 'MAX'], 'NORMAL'))
-  const [hybridAlpha, setHybridAlpha] = useState(() => getInitialPreference('veriscope-hybrid-alpha', ['0.3', '0.5', '0.7'], '0.5'))
-  const [forceWebSearch, setForceWebSearch] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [conversationSearch, setConversationSearch] = useState('')
-  const [activeConversationId, setActiveConversationId] = useState(null)
+  const [sidebarOpen, setSidebarOpen] = useState(() => globalThis.matchMedia?.('(min-width: 768px)').matches ?? true)
+  const [sidebarSearch, setSidebarSearch] = useState('')
   const [conversations, setConversations] = useState([])
+  const [listLoading, setListLoading] = useState(true)
+  const [listError, setListError] = useState('')
+  const [activeId, setActiveId] = useState(null)
   const [messages, setMessages] = useState([])
   const [conversationLoading, setConversationLoading] = useState(false)
-  const [conversationsLoading, setConversationsLoading] = useState(true)
   const [conversationError, setConversationError] = useState('')
-  const [deletingConversationId, setDeletingConversationId] = useState(null)
-  const [query, setQuery] = useState('')
-  const [searchedQuery, setSearchedQuery] = useState('')
-  const [answer, setAnswer] = useState('')
-  const [citations, setCitations] = useState([])
-  const [evidence, setEvidence] = useState([])
-  const [researchMetadata, setResearchMetadata] = useState(null)
-  const [progressStatus, setProgressStatus] = useState('')
-  const [isLoading, setIsLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [serviceHealth, setServiceHealth] = useState(null)
-  const [activeSourceId, setActiveSourceId] = useState(null)
-  const [currentAssistantMessageId, setCurrentAssistantMessageId] = useState(null)
-  const [historySearch, setHistorySearch] = useState('')
-  const [researchHistory, setResearchHistory] = useState([])
-  const [currentResultId, setCurrentResultId] = useState(null)
-  const [claimAttribution, setClaimAttribution] = useState(null)
-  const [insufficientEvidence, setInsufficientEvidence] = useState(false)
-  const [answeredByLLM, setAnsweredByLLM] = useState(false)
-  const [searchedWeb, setSearchedWeb] = useState(false)
-  const [llmError, setLlmError] = useState(null)
-  const [evidenceStatus, setEvidenceStatus] = useState('')
-  const [runtimeMetrics, setRuntimeMetrics] = useState(null)
-  const [runtimeError, setRuntimeError] = useState('')
-  const [runtimeLoading, setRuntimeLoading] = useState(false)
-  const searchController = useRef(null)
-  const conversationLoadController = useRef(null)
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState('')
+  const [deleteTarget, setDeleteTarget] = useState(null)
+  const [deleting, setDeleting] = useState(false)
+  const [showJump, setShowJump] = useState(false)
+
   const requestInFlight = useRef(false)
-  const activeConversationRef = useRef(null)
-  const conversationGeneration = useRef(0)
-  const composerRef = useRef(null)
+  const searchController = useRef(null)
+  const loadController = useRef(null)
+  const activeIdRef = useRef(null)
+  const generation = useRef(0)
+  const persistedIds = useRef(new Set())
+  const scrollRef = useRef(null)
+  const stickRef = useRef(true)
+  const textareaRef = useRef(null)
+
+  // ---------- Sidebar follows the breakpoint: open on desktop, closed overlay on mobile ----------
+  useEffect(() => {
+    setSidebarOpen(isDesktop)
+  }, [isDesktop])
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme
-    try {
-      globalThis.localStorage.setItem('veriscope-theme', theme)
-    } catch {
-      // no-op
-    }
-  }, [theme])
+    if (isDesktop || !sidebarOpen) return undefined
+    const onKeyDown = (event) => event.key === 'Escape' && setSidebarOpen(false)
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [isDesktop, sidebarOpen])
 
+  // Only ever writes a value. Clearing is explicit (new conversation, delete, 404), because on the
+  // first render activeId is still null and clearing here would erase the session we are about to restore.
   useEffect(() => {
-    try {
-      globalThis.localStorage.setItem('veriscope-research-depth', researchDepth)
-      globalThis.localStorage.setItem('veriscope-hybrid-alpha', hybridAlpha)
-    } catch {
-      // no-op
-    }
-  }, [researchDepth, hybridAlpha])
+    if (activeId) writeStoredSession(activeId)
+  }, [activeId])
 
-  useEffect(() => {
-    try {
-      if (activeConversationId) {
-        globalThis.localStorage.setItem('veriscope-active-session', activeConversationId)
-      } else {
-        globalThis.localStorage.removeItem('veriscope-active-session')
-      }
-    } catch {
-      // no-op
-    }
-  }, [activeConversationId])
+  // ---------- Scrolling: follow new content only while the reader is at the bottom ----------
+  useLayoutEffect(() => {
+    const element = scrollRef.current
+    if (element && stickRef.current) element.scrollTop = element.scrollHeight
+  }, [messages, conversationLoading])
 
-  useEffect(() => {
-    let active = true
-    let timer
-    let controller
-
-    async function checkHealth() {
-      try {
-        controller = new AbortController()
-        const response = await fetch('/api/health', { cache: 'no-store', signal: controller.signal })
-        if (!response.ok) throw new Error(`Backend health returned HTTP ${response.status}`)
-        const data = await response.json()
-        if (active) setServiceHealth(data)
-      } catch (healthError) {
-        if (active && healthError?.name !== 'AbortError') {
-          setServiceHealth({
-            status: 'error',
-            backend: { status: 'offline' },
-            services: null,
-            error: healthError instanceof Error ? healthError.message : 'Backend health is not yet available.',
-          })
-        }
-      } finally {
-        if (active) timer = window.setTimeout(checkHealth, 30000)
-      }
-    }
-
-    checkHealth()
-    return () => {
-      active = false
-      controller?.abort()
-      window.clearTimeout(timer)
-    }
+  const handleScroll = useCallback(() => {
+    const element = scrollRef.current
+    if (!element) return
+    const nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < STICK_THRESHOLD
+    stickRef.current = nearBottom
+    setShowJump(!nearBottom)
   }, [])
 
-  useEffect(() => {
-    let active = true
-    const controller = new AbortController()
-
-    async function loadConversationHistory() {
-      setConversationsLoading(true)
-      setConversationError('')
-      try {
-        const entries = await listConversations({ signal: controller.signal })
-        if (!Array.isArray(entries)) throw new Error('The conversation service returned an invalid list.')
-        if (!active) return
-        entries.sort((first, second) => (second.updatedAt || second.updated_at || '').localeCompare(first.updatedAt || first.updated_at || ''))
-        setConversations(entries)
-        const savedId = getInitialSessionId()
-        if (savedId && entries.some((item) => item.id === savedId)) {
-          await selectConversation(savedId)
-        } else if (savedId) {
-          globalThis.localStorage.removeItem('veriscope-active-session')
-        }
-      } catch (loadError) {
-        if (active && loadError?.name !== 'AbortError') {
-          setConversationError(loadError instanceof Error ? loadError.message : 'Conversation history could not be loaded.')
-        }
-      } finally {
-        if (active) setConversationsLoading(false)
-      }
-    }
-
-    loadConversationHistory()
-    return () => {
-      active = false
-      controller.abort()
-      conversationLoadController.current?.abort()
-      searchController.current?.abort()
-    }
+  const jumpToLatest = useCallback(() => {
+    const element = scrollRef.current
+    if (!element) return
+    stickRef.current = true
+    setShowJump(false)
+    element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' })
   }, [])
 
-  useEffect(() => {
-    let active = true
-    getResearchHistory()
-      .then((entries) => {
-        if (active) setResearchHistory(entries)
-      })
-      .catch(() => {
-        if (active) setResearchHistory([])
-      })
-    return () => {
-      active = false
-    }
-  }, [])
-
-  async function refreshConversations({ silent = false } = {}) {
+  // ---------- Conversation list ----------
+  const refreshConversations = useCallback(async ({ silent = false, signal } = {}) => {
     try {
-      const entries = await listConversations()
+      const entries = await listConversations({ signal })
       if (!Array.isArray(entries)) throw new Error('The conversation service returned an invalid list.')
-      entries.sort((first, second) => (second.updatedAt || second.updated_at || '').localeCompare(first.updatedAt || first.updated_at || ''))
-      setConversations(entries)
-      setConversationError('')
+      entries.forEach((entry) => persistedIds.current.add(entry.id))
+      setConversations(sortConversations(entries))
+      setListError('')
       return entries
-    } catch (loadError) {
-      if (!silent) {
-        setConversationError(loadError instanceof Error ? loadError.message : 'Conversation history could not be loaded.')
-      }
+    } catch (error) {
+      if (error?.name === 'AbortError') return null
+      if (!silent) setListError(errorText(error, 'Conversation history could not be loaded.'))
       return null
     }
-  }
+  }, [])
 
-  function clearConversationDisplay() {
-    setMessages([])
-    setQuery('')
-    setSearchedQuery('')
-    setAnswer('')
-    setCitations([])
-    setEvidence([])
-    setResearchMetadata(null)
-    setProgressStatus('')
-    setError('')
-    setClaimAttribution(null)
-    setInsufficientEvidence(false)
-    setAnsweredByLLM(false)
-    setSearchedWeb(false)
-    setLlmError(null)
-    setEvidenceStatus('')
-    setActiveSourceId(null)
-    setCurrentAssistantMessageId(null)
-    setCurrentResultId(null)
-  }
-
-  async function selectConversation(conversationId) {
+  const selectConversation = useCallback(async (conversationId) => {
     if (!conversationId) return
-    const generation = ++conversationGeneration.current
+    const run = ++generation.current
+
     searchController.current?.abort()
     searchController.current = null
     requestInFlight.current = false
-    conversationLoadController.current?.abort()
+    loadController.current?.abort()
     const controller = new AbortController()
-    conversationLoadController.current = controller
-    activeConversationRef.current = conversationId
-    setActiveConversationId(conversationId)
-    setConversationLoading(true)
+    loadController.current = controller
+
+    activeIdRef.current = conversationId
+    setActiveId(conversationId)
+    setMessages([])
+    setBusy(false)
+    setProgress('')
     setConversationError('')
-    setIsLoading(false)
-    setProgressStatus('')
-    clearConversationDisplay()
+    setConversationLoading(true)
+    stickRef.current = true
 
     try {
       const conversation = await getConversation(conversationId, { signal: controller.signal })
-      if (generation !== conversationGeneration.current || activeConversationRef.current !== conversationId) return
+      if (run !== generation.current) return
       if (conversation.id !== conversationId || !Array.isArray(conversation.messages)) {
         throw new Error('The conversation service returned an invalid conversation.')
       }
-      setMessages(conversation.messages)
-    } catch (loadError) {
-      if (generation === conversationGeneration.current && loadError?.name !== 'AbortError') {
-        setConversationError(loadError instanceof Error ? loadError.message : 'This conversation could not be loaded.')
-        if (loadError?.status === 404) {
-          setConversations((entries) => entries.filter((entry) => entry.id !== conversationId))
-          activeConversationRef.current = null
-          setActiveConversationId(null)
-        }
+      setMessages(conversation.messages.map(normalizeRestoredMessage))
+    } catch (error) {
+      if (run !== generation.current || error?.name === 'AbortError') return
+      setConversationError(errorText(error, 'This conversation could not be loaded.'))
+      if (error?.status === 404) {
+        persistedIds.current.delete(conversationId)
+        setConversations((entries) => entries.filter((entry) => entry.id !== conversationId))
+        activeIdRef.current = null
+        setActiveId(null)
+        writeStoredSession(null)
       }
     } finally {
-      if (generation === conversationGeneration.current) {
+      if (run === generation.current) {
         setConversationLoading(false)
-        if (conversationLoadController.current === controller) {
-          conversationLoadController.current = null
-        }
+        if (loadController.current === controller) loadController.current = null
       }
     }
-  }
+  }, [])
 
-  function startNewConversation() {
-    conversationGeneration.current += 1
+  // Initial load, restoring the conversation that was open last time.
+  useEffect(() => {
+    const controller = new AbortController()
+
+    async function load() {
+      setListLoading(true)
+      const entries = await refreshConversations({ signal: controller.signal })
+      if (controller.signal.aborted) return
+      setListLoading(false)
+
+      const savedId = readStoredSession()
+      if (savedId && entries?.some((entry) => entry.id === savedId)) selectConversation(savedId)
+      else if (savedId && entries) writeStoredSession(null)
+    }
+
+    load()
+    return () => {
+      controller.abort()
+      loadController.current?.abort()
+      searchController.current?.abort()
+    }
+  }, [refreshConversations, selectConversation])
+
+  const startNewConversation = useCallback(() => {
+    generation.current += 1
     searchController.current?.abort()
     searchController.current = null
-    conversationLoadController.current?.abort()
-    conversationLoadController.current = null
+    loadController.current?.abort()
+    loadController.current = null
     requestInFlight.current = false
-    activeConversationRef.current = null
-    setActiveConversationId(null)
-    setIsLoading(false)
-    setProgressStatus('')
+    activeIdRef.current = null
+    writeStoredSession(null)
+
+    setActiveId(null)
+    setMessages([])
+    setQuery('')
+    setBusy(false)
+    setProgress('')
     setConversationLoading(false)
     setConversationError('')
-    setForceWebSearch(false)
-    clearConversationDisplay()
-    setSidebarOpen(false)
-  }
+    setForceWeb(false)
+    stickRef.current = true
+    if (!isDesktop) setSidebarOpen(false)
+    window.setTimeout(() => textareaRef.current?.focus(), 0)
+  }, [isDesktop])
 
-  function stopSearch() {
-    searchController.current?.abort()
-  }
+  const handleSelect = useCallback(
+    (id) => {
+      if (!isDesktop) setSidebarOpen(false)
+      if (id !== activeIdRef.current) selectConversation(id)
+    },
+    [isDesktop, selectConversation]
+  )
 
-  async function handleDeleteConversation(conversation) {
-    const title = conversation.title || 'Untitled conversation'
-    if (!window.confirm(`Delete "${title}" and all of its messages? This cannot be undone.`)) return
+  async function confirmDelete() {
+    const target = deleteTarget
+    if (!target || deleting) return
 
-    const isActive = activeConversationRef.current === conversation.id
-    if (isActive) {
-      conversationGeneration.current += 1
-      searchController.current?.abort()
-      searchController.current = null
-      requestInFlight.current = false
-      setIsLoading(false)
-      setProgressStatus('')
-    }
-    setDeletingConversationId(conversation.id)
+    setDeleting(true)
+    const isActive = activeIdRef.current === target.id
     try {
-      await deleteConversationRequest(conversation.id)
-      setConversations((entries) => entries.filter((entry) => entry.id !== conversation.id))
-      if (isActive) {
-        activeConversationRef.current = null
-        setActiveConversationId(null)
-        clearConversationDisplay()
-      }
-    } catch (deleteError) {
-      setConversationError(deleteError instanceof Error ? deleteError.message : 'Conversation could not be deleted.')
+      await deleteConversationRequest(target.id)
+      persistedIds.current.delete(target.id)
+      setConversations((entries) => entries.filter((entry) => entry.id !== target.id))
+      if (isActive) startNewConversation()
+      setDeleteTarget(null)
+    } catch (error) {
+      setDeleteTarget(null)
+      setListError(errorText(error, 'Conversation could not be deleted.'))
     } finally {
-      setDeletingConversationId(null)
+      setDeleting(false)
     }
   }
 
-  async function handleSearch(event) {
-    event?.preventDefault()
-    const trimmed = query.trim()
-    if (!trimmed || requestInFlight.current) return
+  // ---------- Research ----------
+  async function handleSubmit() {
+    const text = query.trim()
+    if (!text || requestInFlight.current) return
 
-    const forceWeb = Boolean(forceWebSearch)
-    const sessionId = activeConversationRef.current || createResultId()
-    const generation = conversationGeneration.current
-    const userMessageId = `pending-user-${createResultId()}`
-    const assistantMessageId = `pending-assistant-${createResultId()}`
+    const run = generation.current
+    const sessionId = activeIdRef.current || createId()
+    const assistantKey = `a-${createId()}`
+    const userKey = `u-${createId()}`
     const controller = new AbortController()
+
     requestInFlight.current = true
     searchController.current = controller
-    activeConversationRef.current = sessionId
-    setActiveConversationId(sessionId)
-    setIsLoading(true)
-    setProgressStatus('Starting local research...')
-    setError('')
-    setAnswer('')
-    setCitations([])
-    setEvidence([])
+    activeIdRef.current = sessionId
+    stickRef.current = true
+
+    setActiveId(sessionId)
+    setBusy(true)
+    setProgress('Starting…')
+    setConversationError('')
+    setQuery('')
     setMessages((current) => [
       ...current,
-      { id: userMessageId, conversationId: sessionId, role: 'user', content: trimmed, status: 'completed', evidenceReferences: [] },
-      { id: assistantMessageId, conversationId: sessionId, role: 'assistant', content: '', status: 'streaming', evidenceReferences: [] },
+      { id: userKey, clientKey: userKey, conversationId: sessionId, role: 'user', content: text, status: 'completed' },
+      { id: assistantKey, clientKey: assistantKey, conversationId: sessionId, role: 'assistant', content: '', status: 'streaming' },
     ])
-    setClaimAttribution(null)
-    setInsufficientEvidence(false)
-    setEvidenceStatus('')
-    setLlmError(null)
-    setAnsweredByLLM(false)
-    setSearchedWeb(false)
-    setActiveSourceId(null)
-    setCurrentResultId(null)
-    setSearchedQuery(trimmed)
+
+    const patchAssistant = (patch) =>
+      setMessages((current) =>
+        current.map((message) =>
+          message.clientKey === assistantKey ? (typeof patch === 'function' ? patch(message) : { ...message, ...patch }) : message
+        )
+      )
+
+    // Tokens arrive far faster than the screen refreshes; batch them to one render per frame.
+    let pendingText = ''
+    let frame = 0
+    const flushTokens = () => {
+      if (frame) cancelAnimationFrame(frame)
+      frame = 0
+      if (!pendingText) return
+      const chunk = pendingText
+      pendingText = ''
+      patchAssistant((message) => ({ ...message, content: message.content + chunk }))
+    }
+    const discardTokens = () => {
+      if (frame) cancelAnimationFrame(frame)
+      frame = 0
+      pendingText = ''
+    }
+
+    const isCurrent = () => run === generation.current && activeIdRef.current === sessionId
 
     try {
-      const knownConversation = conversations.some((conversation) => conversation.id === sessionId)
-      const payload = {
-        query: trimmed,
-        forceWebSearch: forceWeb,
-        depth: researchDepth,
-        alpha: Number(hybridAlpha),
-      }
-
-      const response = knownConversation
+      const payload = { query: text, forceWebSearch: Boolean(forceWeb), depth, alpha }
+      const response = persistedIds.current.has(sessionId)
         ? await sendConversationMessage(sessionId, payload, controller.signal)
         : await startConversationResearch({ ...payload, sessionId }, controller.signal)
 
-      if (generation !== conversationGeneration.current || activeConversationRef.current !== sessionId) return
+      if (!isCurrent()) return
 
-      const data = await readSearchStream(response, (status) => {
-        if (generation !== conversationGeneration.current) return
-        if (status === 'Querying SearXNG...') setAnswer('')
-        setProgressStatus(status)
-      }, (token) => {
-        if (generation !== conversationGeneration.current) return
-        setAnswer((current) => current + token)
-        setMessages((current) => current.map((message) => (message.id === assistantMessageId ? { ...message, content: message.content + token, status: 'streaming' } : message)))
+      const data = await readResearchStream(response, {
+        onStatus(status) {
+          if (!isCurrent()) return
+          // The backend restarts the answer after the local attempt and switches to web research.
+          if (/^Querying SearXNG/i.test(status)) {
+            discardTokens()
+            patchAssistant({ content: '' })
+          }
+          setProgress(describeProgress(status))
+        },
+        onToken(token) {
+          if (!isCurrent()) return
+          pendingText += token
+          if (!frame) frame = requestAnimationFrame(flushTokens)
+        },
       })
 
-      if (generation !== conversationGeneration.current || activeConversationRef.current !== sessionId) return
+      if (!isCurrent()) return
+      discardTokens()
+
       if (typeof data.answer !== 'string' || !Array.isArray(data.citations)) {
         throw new Error(data.message || 'The research service returned an unexpected response.')
       }
 
-      const finalAssistantMessageId = data.assistantMessageId || assistantMessageId
-      const finalUserMessageId = data.userMessageId || userMessageId
-      const messageEvidenceReferences = (Array.isArray(data.evidence) ? data.evidence : []).map((item) => ({
-        sourceId: Number.isInteger(item?.id) ? item.id : null,
-        chunkId: Number.isInteger(item?.chunkId) ? item.chunkId : null,
-        title: typeof item?.title === 'string' ? item.title : null,
-        url: typeof item?.url === 'string' ? item.url : null,
-        snippet: typeof item?.text === 'string' ? item.text : null,
-      }))
-
+      persistedIds.current.add(sessionId)
       setMessages((current) =>
         current.map((message) => {
-          if (message.id === userMessageId) return { ...message, id: finalUserMessageId }
-          if (message.id === assistantMessageId) {
+          if (message.clientKey === userKey) return { ...message, id: data.userMessageId || message.id }
+          if (message.clientKey === assistantKey) {
             return {
               ...message,
-              id: finalAssistantMessageId,
+              id: data.assistantMessageId || message.id,
               content: data.answer,
               status: 'completed',
-              evidenceReferences: messageEvidenceReferences,
+              research: data,
             }
           }
           return message
         })
       )
-      setCurrentAssistantMessageId(finalAssistantMessageId)
-      setAnswer(data.answer)
-      setCitations(data.citations)
-      setEvidence(data.evidence || [])
-      setClaimAttribution(data.claimAttribution || null)
-      setInsufficientEvidence(Boolean(data.insufficientEvidence))
-      setEvidenceStatus(data.evidenceStatus || '')
-      setLlmError(data.llmError || null)
-      setAnsweredByLLM(Boolean(data.answeredByLLM))
-      setSearchedWeb(Boolean(data.searchedWeb))
-      setResearchMetadata(data.researchMetadata || null)
-      setCurrentResultId(createResultId())
-
-      try {
-        await addResearchResult({
-          id: createResultId(),
-          sessionId: data.conversationId || data.sessionId || sessionId,
-          query: trimmed,
-          answer: data.answer,
-          citations: data.citations,
-          evidence: Array.isArray(data.evidence) ? data.evidence : [],
-          claimAttribution: data.claimAttribution || null,
-          warnings: Array.isArray(data.warnings) ? data.warnings : [],
-          insufficientEvidence: Boolean(data.insufficientEvidence),
-          answeredByLLM: Boolean(data.answeredByLLM),
-          searchedWeb: Boolean(data.searchedWeb),
-          evidenceStatus: data.evidenceStatus || '',
-          llmError: data.llmError || null,
-          researchMetadata: data.researchMetadata || null,
-          depth: researchDepth,
-          alpha: Number(hybridAlpha),
-          missingEvidence: data.missingEvidence || '',
-          createdAt: new Date().toISOString(),
-          saved: false,
+      refreshConversations({ silent: true })
+    } catch (error) {
+      if (isCurrent()) {
+        flushTokens()
+        const aborted = error?.name === 'AbortError'
+        patchAssistant({
+          status: 'failed',
+          error: aborted ? 'Research was stopped.' : errorText(error, 'Research could not be completed.'),
         })
-        setResearchHistory((entries) => [{ ...entries[0] }, ...entries])
-      } catch {
-        // no-op for local history fallback
-      }
-
-      await refreshConversations({ silent: true })
-    } catch (searchError) {
-      if (generation === conversationGeneration.current && activeConversationRef.current === sessionId) {
-        setError(searchError?.name === 'AbortError' ? 'Research was stopped before completion.' : searchError instanceof Error ? searchError.message : 'Something went wrong. Please try again.')
-        setMessages((current) => current.map((message) => (message.id === assistantMessageId ? { ...message, content: searchError?.name === 'AbortError' ? 'Research was interrupted.' : searchError instanceof Error ? searchError.message : 'Research could not be completed.', status: 'failed' } : message)))
-        await refreshConversations({ silent: true })
+        refreshConversations({ silent: true })
       }
     } finally {
+      discardTokens()
       if (searchController.current === controller) searchController.current = null
-      if (generation === conversationGeneration.current) {
+      if (run === generation.current) {
         requestInFlight.current = false
-        setIsLoading(false)
-        setProgressStatus('')
+        setBusy(false)
+        setProgress('')
       }
     }
   }
 
-  function readSearchStream(response, onStatus, onToken) {
-    if (!response.body) throw new Error('The research service returned an empty stream.')
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let result = null
+  const handleStop = useCallback(() => searchController.current?.abort(), [])
 
-    const processFrame = (frame) => {
-      let event = 'message'
-      const data = []
-      for (const line of frame.split('\n')) {
-        if (line.startsWith('event:')) event = line.slice(6).trim()
-        if (line.startsWith('data:')) data.push(line.slice(5).trim())
-      }
-      if (data.length === 0) return
-      const payload = JSON.parse(data.join('\n'))
-      if (event === 'status') onStatus(payload.message)
-      if (event === 'token') onToken(payload.text)
-      if (event === 'done') result = payload.result
-      if (event === 'error') throw new Error(payload.error || 'Research could not be completed.')
-    }
-
-    return (async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read()
-          buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, '\n')
-          let frameEnd
-          while ((frameEnd = buffer.indexOf('\n\n')) !== -1) {
-            processFrame(buffer.slice(0, frameEnd))
-            buffer = buffer.slice(frameEnd + 2)
-          }
-          if (done) break
-        }
-        if (buffer.trim()) processFrame(buffer)
-      } finally {
-        reader.releaseLock()
-      }
-
-      if (!result) throw new Error('The research stream ended before returning a result.')
-      return result
-    })()
-  }
-
-  async function toggleSavedResult(entry) {
-    try {
-      const updated = await setResearchSaved(entry.id, !entry.saved)
-      setResearchHistory((entries) => entries.map((item) => (item.id === updated.id ? updated : item)))
-    } catch {
-      // no-op
-    }
-  }
-
-  async function removeResearchResult(entry) {
-    try {
-      await deleteResearchResult(entry.id)
-      setResearchHistory((entries) => entries.filter((item) => item.id !== entry.id))
-      if (currentResultId === entry.id) setCurrentResultId(null)
-    } catch {
-      // no-op
-    }
-  }
-
-  async function clearHistory() {
-    if (!window.confirm('Delete all local research history?')) return
-    try {
-      await clearResearchHistory()
-      setResearchHistory([])
-      setCurrentResultId(null)
-    } catch {
-      // no-op
-    }
-  }
-
-  const backendOnline = serviceHealth?.backend?.status === 'online' || serviceHealth?.status === 'online'
-  const statusText = serviceHealth ? (backendOnline ? 'Systems operational · Local AI · Retrieval · Web search' : 'Backend starting') : 'Systems checking...'
-
-  const filteredConversations = conversations.filter((conversation) => {
-    const base = `${conversation.title || 'Untitled conversation'} ${conversation.updatedAt || conversation.updated_at || ''}`
-    const query = conversationSearch.trim().toLowerCase()
-    return !query || base.toLowerCase().includes(query)
-  })
-
-  const hasConversation = Boolean(activeConversationId || messages.length > 0 || searchedQuery)
+  const landing = !activeId
+  const lastStreamingKey = busy ? messages.findLast?.((message) => message.status === 'streaming')?.clientKey ?? null : null
 
   return (
-    <main className="app-shell">
-      <div className={sidebarOpen ? 'sidebar-backdrop is-visible' : 'sidebar-backdrop'} onClick={() => setSidebarOpen(false)} aria-hidden="true" />
-
+    <div className="app">
       <Sidebar
-        conversations={filteredConversations}
-        activeConversationId={activeConversationId}
-        conversationSearch={conversationSearch}
-        setConversationSearch={setConversationSearch}
-        onSelectConversation={async (conversationId) => {
-          setSidebarOpen(false)
-          await selectConversation(conversationId)
-        }}
-        onDeleteConversation={(conversation) => {
-          setSidebarOpen(false)
-          void handleDeleteConversation(conversation)
-        }}
-        onNewResearch={() => {
-          setSidebarOpen(false)
-          startNewConversation()
-        }}
+        open={sidebarOpen}
+        conversations={conversations}
+        activeId={activeId}
+        loading={listLoading}
+        error={listError}
+        search={sidebarSearch}
+        onSearchChange={setSidebarSearch}
+        onSelect={handleSelect}
+        onDelete={setDeleteTarget}
+        onNew={startNewConversation}
         onClose={() => setSidebarOpen(false)}
+        onRetry={() => {
+          setListLoading(true)
+          refreshConversations().finally(() => setListLoading(false))
+        }}
         theme={theme}
-        onToggleTheme={() => setTheme((current) => (current === 'dark' ? 'light' : 'dark'))}
-        isOpen={sidebarOpen}
+        onThemeChange={setTheme}
       />
 
-      <div className="workspace-shell">
-        <header className="workspace-header">
-          <button type="button" className="sidebar-toggle icon-button" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar">
-            ☰
-          </button>
+      {!isDesktop && sidebarOpen && (
+        <button type="button" className="scrim" aria-label="Close sidebar" onClick={() => setSidebarOpen(false)} />
+      )}
 
-          <div className="header-status" role="status" aria-live="polite">
-            <span className={backendOnline ? 'status-pulse is-live' : 'status-pulse'} />
-            {statusText}
-          </div>
-
-          <button type="button" className="icon-button theme-button" onClick={() => setTheme((current) => (current === 'dark' ? 'light' : 'dark'))} aria-label="Toggle theme">
-            <ThemeIcon theme={theme} />
-          </button>
+      <main className="workspace" data-landing={landing}>
+        <header className="topbar">
+          {!sidebarOpen && (
+            <button type="button" className="icon-btn" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar">
+              <PanelLeftIcon size={18} />
+            </button>
+          )}
         </header>
 
-        <div className="workspace">
-          {!hasConversation ? (
-            <LandingScreen onFocusInput={() => composerRef.current?.querySelector('textarea')?.focus()} />
-          ) : (
-            <MessageList
-              messages={messages}
-              citations={citations}
-              evidence={evidence}
-              activeSourceId={activeSourceId}
-              onOpenSource={(sourceId) => setActiveSourceId((current) => (current === sourceId ? null : sourceId))}
-              isLoading={isLoading}
-              progressStatus={progressStatus}
-            />
-          )}
+        <div className="stage">
+          <div className="scroll" ref={scrollRef} onScroll={handleScroll}>
+            <div className="column thread">
+              {conversationLoading && <p className="thread-note">Loading conversation…</p>}
+              {messages.map((message) =>
+                message.role === 'user' ? (
+                  <UserMessage key={message.clientKey ?? message.id} message={message} />
+                ) : (
+                  <AssistantMessage
+                    key={message.clientKey ?? message.id}
+                    message={message}
+                    progress={message.clientKey && message.clientKey === lastStreamingKey ? progress : undefined}
+                  />
+                )
+              )}
+            </div>
+          </div>
 
-          <div ref={composerRef} className="composer-panel">
-            <ChatComposer
-              query={query}
-              setQuery={setQuery}
-              onSubmit={(event) => handleSearch(event)}
-              isLoading={isLoading}
-              researchDepth={researchDepth}
-              setResearchDepth={setResearchDepth}
-              hybridAlpha={hybridAlpha}
-              setHybridAlpha={setHybridAlpha}
-              forceWebSearch={forceWebSearch}
-              setForceWebSearch={setForceWebSearch}
+          {showJump && !landing && (
+            <button type="button" className="jump" onClick={jumpToLatest} aria-label="Jump to latest">
+              <ArrowDownIcon size={16} />
+            </button>
+          )}
+        </div>
+
+        <div className="dock">
+          <div className="column">
+            {landing && (
+              <div className="landing">
+                <h1>VeriScope</h1>
+                <p>Follow the evidence.</p>
+              </div>
+            )}
+
+            {conversationError && (
+              <div className="banner" role="alert">
+                <span>{conversationError}</span>
+                {activeId && !conversationLoading && messages.length === 0 && (
+                  <button type="button" className="link-btn" onClick={() => selectConversation(activeId)}>
+                    Retry
+                  </button>
+                )}
+              </div>
+            )}
+
+            <Composer
+              value={query}
+              onChange={setQuery}
+              onSubmit={handleSubmit}
+              onStop={handleStop}
+              busy={busy}
+              depth={depth}
+              onDepthChange={setDepth}
+              alpha={alpha}
+              onAlphaChange={setAlpha}
+              forceWeb={forceWeb}
+              onForceWebChange={setForceWeb}
+              textareaRef={textareaRef}
             />
+            <StatusLine health={health} />
           </div>
         </div>
-      </div>
-    </main>
+      </main>
+
+      <ConfirmDialog
+        open={Boolean(deleteTarget)}
+        title="Delete conversation?"
+        description={`"${deleteTarget ? conversationTitle(deleteTarget) : ''}" and all of its messages will be permanently deleted.`}
+        confirmLabel={deleting ? 'Deleting…' : 'Delete'}
+        onConfirm={confirmDelete}
+        onCancel={() => !deleting && setDeleteTarget(null)}
+      />
+    </div>
   )
 }
-
-export default App

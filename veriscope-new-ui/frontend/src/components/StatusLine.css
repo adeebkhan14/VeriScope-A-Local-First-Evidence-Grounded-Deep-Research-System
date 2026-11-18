@@ -1,0 +1,18 @@
+.status-line {
+  margin: 0;
+  padding: 10px 8px 0;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+  color: var(--text-2);
+}
+
+.status-line [data-tone='warn'],
+.status-line[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.status-line [data-tone='danger'],
+.status-line[data-tone='danger'] {
+  color: var(--danger);
+}
