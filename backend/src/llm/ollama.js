@@ -414,7 +414,9 @@ Strict Rules:
 3. If the current evidence does NOT contain enough facts to answer the question, state:
 "Based on the retrieved sources, there is insufficient evidence to answer this question."
 Then describe what information is present and what is missing. Never produce a confident guess.
-4. Keep the answer clear, objective, and structured.`,
+4. Keep the answer clear, objective, and structured.
+5. For allegations involving real people, preserve claim type and attribution. Distinguish confirmed facts, reported allegations, denials, investigative suspicions, corroboration, and speculation. Never convert a report or suspicion into a verified fact.
+6. Attribute allegations to the specific reporting source. Do not cite Reddit or social discussion as independent confirmation. Preserve explicit limitations, denials, or lack of verification stated by a source.`,
   };
   const currentMessage = {
     role: "user",
@@ -566,7 +568,9 @@ export async function tryDirectAnswer(query, options = {}) {
 
 Do not introduce new factual claims or treat prior assistant answers as verified evidence. If the requested reference is still unclear, ask one concise clarification question.`
     : answerOnly
-      ? `You are a knowledgeable assistant. Answer the user's question using stable, established knowledge. Do not classify the route, request web research, or output a routing label. If the answer depends on current information you cannot verify, say so plainly instead of guessing.`
+      ? `You are a knowledgeable assistant. Answer the user's question using stable, established knowledge. Do not classify the route, request web research, or output a routing label. If the answer depends on current information you cannot verify, say so plainly instead of guessing.
+
+For allegations involving a real person, never present an allegation as a confirmed fact. Separate verified facts, reported allegations, denials, suspicions, and speculation; attribute each claim and preserve uncertainty.`
     : `You are a knowledgeable AI assistant.
 
 Analyze the user's query and decide whether you can provide a reliable, complete, and accurate answer directly from your existing internal knowledge, OR if an up-to-date web search is needed.

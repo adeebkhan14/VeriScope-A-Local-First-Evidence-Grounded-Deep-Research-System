@@ -1,5 +1,6 @@
 import axios from "axios";
 import { deduplicateUrls } from "../retrieval/deduplicate.js";
+import { assertSafeHttpUrl } from "./urlSafety.js";
 
 const SEARXNG_URL = process.env.SEARXNG_URL || "http://localhost:8080";
 const MAX_SEARCH_RESULTS = 5;
@@ -40,14 +41,23 @@ export async function discoverUrls(query) {
     }
 
     // Map and normalize
-    const candidates = rawResults
+    const candidates = (await Promise.all(
+      rawResults
       .slice(0, RAW_FETCH_LIMIT)
       .filter((result) => result && typeof result === "object")
-      .map((result) => ({
-        title: typeof result.title === "string" ? result.title : "Untitled",
-        url: result.url,
-        content: typeof result.content === "string" ? result.content : "",
-      }));
+      .map(async (result) => {
+        try {
+          const safeUrl = await assertSafeHttpUrl(result.url);
+          return {
+            title: typeof result.title === "string" ? result.title : "Untitled",
+            url: safeUrl.toString(),
+            content: typeof result.content === "string" ? result.content : "",
+          };
+        } catch {
+          return null;
+        }
+      })
+    )).filter(Boolean);
 
     // Deduplicate URLs
     const uniqueResults = deduplicateUrls(candidates);

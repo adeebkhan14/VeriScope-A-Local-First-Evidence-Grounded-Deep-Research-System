@@ -299,6 +299,24 @@ with a generic client-safe message. Individual page scrape failures do
 not stop the rest of the search: available snippets and successfully
 scraped pages are used, and recovery details are returned in `warnings`.
 
+Backend JSON requests are limited to 1 MB. Set `CORS_ORIGINS` to a
+comma-separated allowlist when browser requests should be restricted to
+specific frontend origins, for example:
+
+```sh
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+```
+
+Without `CORS_ORIGINS`, CORS remains permissive for local development.
+Each response includes an `X-Request-ID` header for request tracing.
+
+Run the focused backend test suite from the backend directory:
+
+```sh
+cd backend
+npm test
+```
+
 The pipeline should execute:
 
 ``` text

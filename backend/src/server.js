@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -94,8 +95,37 @@ export function createApp({
 } = {}) {
   const app = express();
 
-  app.use(cors());
-  app.use(express.json());
+  const allowedOrigins = (process.env.CORS_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  app.disable("x-powered-by");
+  app.use((req, res, next) => {
+    const requestId =
+      typeof req.get("x-request-id") === "string" && req.get("x-request-id").length <= 128
+        ? req.get("x-request-id")
+        : randomUUID();
+    req.requestId = requestId;
+    res.setHeader("X-Request-ID", requestId);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Frame-Options", "DENY");
+    next();
+  });
+  app.use(cors(
+    allowedOrigins.length
+      ? {
+          origin(origin, callback) {
+            if (!origin || allowedOrigins.includes(origin)) {
+              callback(null, true);
+            } else {
+              callback(new Error("Origin is not allowed"));
+            }
+          },
+        }
+      : undefined
+  ));
+  app.use(express.json({ limit: "1mb" }));
 
   app.use("/api/conversations", createConversationRouter(conversationStore));
   const searchRouter = createSearchRouter(researchFn, { conversationStore });

@@ -47,6 +47,37 @@ import {
 const MAX_PAGES_TO_SCRAPE = 5;
 const MAX_PAGE_CHARACTERS = 6000;
 const MAX_EMBEDDING_CANDIDATES = 20;
+const SCRAPE_CONCURRENT_LIMIT = 3;
+
+async function mapWithConcurrency(items, limit, operation) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      try {
+        results[index] = await Promise.resolve(operation(items[index], index));
+      } catch (error) {
+        results[index] = { status: "rejected", reason: error };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(limit, items.length) },
+      () => worker()
+    )
+  );
+  return results.map((value, index) => {
+    if (value && typeof value === "object" && value.status === "rejected") {
+      return { status: "rejected", reason: value.reason };
+    }
+    return { status: "fulfilled", value };
+  });
+}
 
 /**
  * Main research pipeline:
@@ -235,6 +266,8 @@ export async function research(query, options = {}) {
     resolvedQuery: route.resolvedQuery || originalQuery,
     routingDecision: route.route || null,
     routingReason: route.reason || null,
+    resolvedEntities: route.resolvedEntities || [],
+    referenceResolution: route.referenceResolution || "none",
     isFollowUp: route.isFollowUp || false,
     requiresFreshEvidence: route.requiresFreshEvidence || false,
     reusePreviousEvidence: route.reusePreviousEvidence || false,
@@ -317,7 +350,13 @@ export async function research(query, options = {}) {
       route.evidence,
       researchSettings.topK,
       effectiveEvidenceTokenBudget
-    );
+    ).map((source) => ({
+      ...source,
+      reused: true,
+      evidenceId: source.evidenceId || null,
+      originalCreatedAt: source.createdAt || null,
+      originalResearchTurn: source.originalResearchTurn || null,
+    }));
     if (reusedEvidence.length === 0) {
       route = {
         ...route,
@@ -567,8 +606,10 @@ export async function research(query, options = {}) {
   const selectedResults = searchResults.slice(0, MAX_PAGES_TO_SCRAPE);
   reportProgress(`Scraping ${selectedResults.length} pages...`);
 
-  const scrapeOutcomes = await Promise.allSettled(
-    selectedResults.map(async (result) => {
+  const scrapeOutcomes = await mapWithConcurrency(
+    selectedResults,
+    SCRAPE_CONCURRENT_LIMIT,
+    async (result) => {
       const page = await scrapeFn(result, { allowBrowserFallback: false });
       const pageContent =
         typeof page?.content === "string" ? page.content.trim() : "";
@@ -592,7 +633,7 @@ export async function research(query, options = {}) {
         ...page,
         content: content.slice(0, MAX_PAGE_CHARACTERS),
       };
-    })
+    }
   );
   const scrapedPages = scrapeOutcomes.map((outcome, index) => {
     if (outcome.status === "fulfilled") return outcome.value;

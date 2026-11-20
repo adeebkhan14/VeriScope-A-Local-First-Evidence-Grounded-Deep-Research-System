@@ -1,6 +1,7 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
 import { chromium } from "playwright";
+import { assertSafeHttpUrl } from "./urlSafety.js";
 
 /**
  * Scrapes a single webpage with fallback handling:
@@ -70,9 +71,11 @@ async function scrapeWithAxios(result) {
   }
 
   try {
+    await assertSafeHttpUrl(result.url);
     const response = await axios.get(result.url, {
       timeout: 8000,
       maxContentLength: 5 * 1024 * 1024, // 5MB max
+      maxRedirects: 5,
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -83,6 +86,11 @@ async function scrapeWithAxios(result) {
       },
       validateStatus: (status) => status >= 200 && status < 400,
     });
+    const finalUrl =
+      response.request?.res?.responseUrl ||
+      response.request?.responseURL ||
+      result.url;
+    await assertSafeHttpUrl(finalUrl);
 
     const contentType = response.headers["content-type"] || "";
     if (
@@ -140,6 +148,7 @@ async function scrapeWithPlaywright(result) {
   let browser = null;
 
   try {
+    await assertSafeHttpUrl(result.url);
     browser = await chromium.launch({
       headless: true,
     });
@@ -155,6 +164,7 @@ async function scrapeWithPlaywright(result) {
       waitUntil: "domcontentloaded",
       timeout: 10000,
     });
+    await assertSafeHttpUrl(page.url());
 
     await page.waitForTimeout(1000);
 

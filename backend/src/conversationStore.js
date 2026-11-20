@@ -56,6 +56,8 @@ export function createConversationStore({ dbPath = DEFAULT_DB_PATH } = {}) {
 
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA foreign_keys = ON;");
+  db.exec("PRAGMA journal_mode = WAL;");
+  db.exec("PRAGMA busy_timeout = 5000;");
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
@@ -102,6 +104,20 @@ export function createConversationStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
     );
   `);
+  const evidenceColumns = db.prepare("PRAGMA table_info(evidence_references)").all();
+  const evidenceColumnNames = new Set(evidenceColumns.map((column) => column.name));
+  if (!evidenceColumnNames.has("evidence_id")) {
+    db.exec("ALTER TABLE evidence_references ADD COLUMN evidence_id TEXT;");
+  }
+  if (!evidenceColumnNames.has("original_created_at")) {
+    db.exec("ALTER TABLE evidence_references ADD COLUMN original_created_at TEXT;");
+  }
+  if (!evidenceColumnNames.has("original_research_turn")) {
+    db.exec("ALTER TABLE evidence_references ADD COLUMN original_research_turn TEXT;");
+  }
+  if (!evidenceColumnNames.has("reused")) {
+    db.exec("ALTER TABLE evidence_references ADD COLUMN reused INTEGER NOT NULL DEFAULT 0;");
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversation_summaries (
       conversation_id TEXT PRIMARY KEY,
@@ -117,6 +133,14 @@ export function createConversationStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       failed_at TEXT NOT NULL,
       FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
     );
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
+      ON messages(conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_evidence_references_message
+      ON evidence_references(message_id);
+    CREATE INDEX IF NOT EXISTS idx_research_runs_conversation_created
+      ON research_runs(conversation_id, created_at);
   `);
   db.prepare(
     `UPDATE messages
@@ -153,6 +177,18 @@ export function createConversationStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     return row;
   }
 
+  function runInTransaction(operation) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   function serializeConversation(row) {
     if (!row) return null;
     return {
@@ -169,18 +205,24 @@ export function createConversationStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     if (!row) return null;
     const evidenceReferences = db
       .prepare(
-        `SELECT source_id, chunk_id, title, url, snippet
+        `SELECT id, source_id, chunk_id, title, url, snippet, created_at,
+                evidence_id, original_created_at, original_research_turn, reused
          FROM evidence_references
          WHERE message_id = ?
         ORDER BY created_at ASC, rowid ASC`
       )
       .all(row.id)
       .map((entry) => ({
+        evidenceId: entry.evidence_id || entry.id,
         sourceId: entry.source_id,
         chunkId: entry.chunk_id,
         title: entry.title,
         url: entry.url,
         snippet: entry.snippet,
+        createdAt: entry.original_created_at || entry.created_at,
+        originalCreatedAt: entry.original_created_at || entry.created_at,
+        originalResearchTurn: entry.original_research_turn || null,
+        reused: Boolean(entry.reused),
       }));
 
     return {
@@ -305,51 +347,57 @@ export function createConversationStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     status = "completed",
     evidenceReferences = [],
   }) {
-    ensureConversationExists(conversationId);
+    return runInTransaction(() => {
+      ensureConversationExists(conversationId);
 
-    const messageId = randomUUID();
-    const createdAt = isoNow();
-    const safeRole = normalizeRole(role);
-    const safeStatus = normalizeStatus(status);
-    const safeContent = String(content ?? "").trim();
+      const messageId = randomUUID();
+      const createdAt = isoNow();
+      const safeRole = normalizeRole(role);
+      const safeStatus = normalizeStatus(status);
+      const safeContent = String(content ?? "").trim();
 
-    if (!safeContent && safeStatus !== "streaming") {
-      const error = new Error("Message content cannot be empty.");
-      error.code = "INVALID_MESSAGE";
-      throw error;
-    }
+      if (!safeContent && safeStatus !== "streaming") {
+        const error = new Error("Message content cannot be empty.");
+        error.code = "INVALID_MESSAGE";
+        throw error;
+      }
 
-    db.prepare(
-      "INSERT INTO messages (id, conversation_id, role, content, status, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(messageId, conversationId, safeRole, safeContent, safeStatus, createdAt);
-
-    const normalizedReferences = Array.isArray(evidenceReferences)
-      ? evidenceReferences.filter(Boolean)
-      : [];
-
-    for (const reference of normalizedReferences) {
-      const referenceId = randomUUID();
-      const sourceId = Number.isInteger(reference.sourceId) ? reference.sourceId : null;
-      const chunkId = Number.isInteger(reference.chunkId) ? reference.chunkId : null;
       db.prepare(
-        "INSERT INTO evidence_references (id, conversation_id, message_id, source_id, chunk_id, title, url, snippet, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      ).run(
-        referenceId,
-        conversationId,
-        messageId,
-        sourceId,
-        chunkId,
-        typeof reference.title === "string" ? reference.title : null,
-        typeof reference.url === "string" ? reference.url : null,
-        typeof reference.snippet === "string" ? reference.snippet : null,
-        createdAt
-      );
-    }
+        "INSERT INTO messages (id, conversation_id, role, content, status, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+      ).run(messageId, conversationId, safeRole, safeContent, safeStatus, createdAt);
 
-    touchConversation(conversationId, createdAt);
-    return serializeMessage(
-      db.prepare("SELECT * FROM messages WHERE id = ?").get(messageId)
-    );
+      const normalizedReferences = Array.isArray(evidenceReferences)
+        ? evidenceReferences.filter(Boolean)
+        : [];
+
+      for (const reference of normalizedReferences) {
+        const referenceId = randomUUID();
+        const sourceId = Number.isInteger(reference.sourceId) ? reference.sourceId : null;
+        const chunkId = Number.isInteger(reference.chunkId) ? reference.chunkId : null;
+        db.prepare(
+          "INSERT INTO evidence_references (id, conversation_id, message_id, source_id, chunk_id, title, url, snippet, created_at, evidence_id, original_created_at, original_research_turn, reused) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(
+          referenceId,
+          conversationId,
+          messageId,
+          sourceId,
+          chunkId,
+          typeof reference.title === "string" ? reference.title : null,
+          typeof reference.url === "string" ? reference.url : null,
+          typeof reference.snippet === "string" ? reference.snippet : null,
+          createdAt,
+          typeof reference.evidenceId === "string" ? reference.evidenceId : null,
+          typeof reference.originalCreatedAt === "string" ? reference.originalCreatedAt : null,
+          typeof reference.originalResearchTurn === "string" ? reference.originalResearchTurn : null,
+          reference.reused === true ? 1 : 0
+        );
+      }
+
+      touchConversation(conversationId, createdAt);
+      return serializeMessage(
+        db.prepare("SELECT * FROM messages WHERE id = ?").get(messageId)
+      );
+    });
   }
 
   function saveAssistantMessage({
@@ -368,30 +416,32 @@ export function createConversationStore({ dbPath = DEFAULT_DB_PATH } = {}) {
   }
 
   function saveResearchRun({ conversationId, messageId, query, metadata = {} }) {
-    ensureConversationExists(conversationId);
-    const runId = randomUUID();
-    const createdAt = isoNow();
-    const safeQuery = typeof query === "string" ? query.trim() : "";
-    if (!safeQuery) {
-      const error = new Error("Research query cannot be empty.");
-      error.code = "INVALID_RESEARCH_QUERY";
-      throw error;
-    }
+    return runInTransaction(() => {
+      ensureConversationExists(conversationId);
+      const runId = randomUUID();
+      const createdAt = isoNow();
+      const safeQuery = typeof query === "string" ? query.trim() : "";
+      if (!safeQuery) {
+        const error = new Error("Research query cannot be empty.");
+        error.code = "INVALID_RESEARCH_QUERY";
+        throw error;
+      }
 
-    db.prepare(
-      "INSERT INTO research_runs (id, conversation_id, message_id, query, created_at, metadata) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(runId, conversationId, messageId, safeQuery, createdAt, jsonValue(metadata));
+      db.prepare(
+        "INSERT INTO research_runs (id, conversation_id, message_id, query, created_at, metadata) VALUES (?, ?, ?, ?, ?, ?)"
+      ).run(runId, conversationId, messageId, safeQuery, createdAt, jsonValue(metadata));
 
-    touchConversation(conversationId, createdAt);
-    return {
-      id: runId,
-      conversationId,
-      messageId,
-      query: safeQuery,
-      createdAt,
-      created_at: createdAt,
-      metadata: typeof metadata === "object" && metadata ? metadata : {},
-    };
+      touchConversation(conversationId, createdAt);
+      return {
+        id: runId,
+        conversationId,
+        messageId,
+        query: safeQuery,
+        createdAt,
+        created_at: createdAt,
+        metadata: typeof metadata === "object" && metadata ? metadata : {},
+      };
+    });
   }
 
   function deleteConversation(conversationId) {
@@ -533,56 +583,62 @@ export function createConversationStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     status,
     evidenceReferences,
   }) {
-    ensureConversationExists(conversationId);
-    const existing = db
-      .prepare(
-        "SELECT * FROM messages WHERE id = ? AND conversation_id = ?"
-      )
-      .get(messageId, conversationId);
-    if (!existing) {
-      const error = new Error(`Message not found: ${messageId}`);
-      error.code = "MESSAGE_NOT_FOUND";
-      throw error;
-    }
-
-    const safeStatus = normalizeStatus(status ?? existing.status);
-    const safeContent =
-      content === undefined ? existing.content : String(content).trim();
-    if (!safeContent && safeStatus !== "streaming") {
-      const error = new Error("Message content cannot be empty.");
-      error.code = "INVALID_MESSAGE";
-      throw error;
-    }
-    const updatedAt = isoNow();
-    db.prepare(
-      "UPDATE messages SET content = ?, status = ? WHERE id = ? AND conversation_id = ?"
-    ).run(safeContent, safeStatus, messageId, conversationId);
-
-    if (Array.isArray(evidenceReferences)) {
-      db.prepare("DELETE FROM evidence_references WHERE message_id = ?").run(
-        messageId
-      );
-      for (const reference of evidenceReferences.filter(Boolean)) {
-        db.prepare(
-          "INSERT INTO evidence_references (id, conversation_id, message_id, source_id, chunk_id, title, url, snippet, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ).run(
-          randomUUID(),
-          conversationId,
-          messageId,
-          Number.isInteger(reference.sourceId) ? reference.sourceId : null,
-          Number.isInteger(reference.chunkId) ? reference.chunkId : null,
-          typeof reference.title === "string" ? reference.title : null,
-          typeof reference.url === "string" ? reference.url : null,
-          typeof reference.snippet === "string" ? reference.snippet : null,
-          updatedAt
-        );
+    return runInTransaction(() => {
+      ensureConversationExists(conversationId);
+      const existing = db
+        .prepare(
+          "SELECT * FROM messages WHERE id = ? AND conversation_id = ?"
+        )
+        .get(messageId, conversationId);
+      if (!existing) {
+        const error = new Error(`Message not found: ${messageId}`);
+        error.code = "MESSAGE_NOT_FOUND";
+        throw error;
       }
-    }
 
-    touchConversation(conversationId, updatedAt);
-    return serializeMessage(
-      db.prepare("SELECT * FROM messages WHERE id = ?").get(messageId)
-    );
+      const safeStatus = normalizeStatus(status ?? existing.status);
+      const safeContent =
+        content === undefined ? existing.content : String(content).trim();
+      if (!safeContent && safeStatus !== "streaming") {
+        const error = new Error("Message content cannot be empty.");
+        error.code = "INVALID_MESSAGE";
+        throw error;
+      }
+      const updatedAt = isoNow();
+      db.prepare(
+        "UPDATE messages SET content = ?, status = ? WHERE id = ? AND conversation_id = ?"
+      ).run(safeContent, safeStatus, messageId, conversationId);
+
+      if (Array.isArray(evidenceReferences)) {
+        db.prepare("DELETE FROM evidence_references WHERE message_id = ?").run(
+          messageId
+        );
+        for (const reference of evidenceReferences.filter(Boolean)) {
+          db.prepare(
+            "INSERT INTO evidence_references (id, conversation_id, message_id, source_id, chunk_id, title, url, snippet, created_at, evidence_id, original_created_at, original_research_turn, reused) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          ).run(
+            randomUUID(),
+            conversationId,
+            messageId,
+            Number.isInteger(reference.sourceId) ? reference.sourceId : null,
+            Number.isInteger(reference.chunkId) ? reference.chunkId : null,
+            typeof reference.title === "string" ? reference.title : null,
+            typeof reference.url === "string" ? reference.url : null,
+            typeof reference.snippet === "string" ? reference.snippet : null,
+            updatedAt,
+            typeof reference.evidenceId === "string" ? reference.evidenceId : null,
+            typeof reference.originalCreatedAt === "string" ? reference.originalCreatedAt : null,
+            typeof reference.originalResearchTurn === "string" ? reference.originalResearchTurn : null,
+            reference.reused === true ? 1 : 0
+          );
+        }
+      }
+
+      touchConversation(conversationId, updatedAt);
+      return serializeMessage(
+        db.prepare("SELECT * FROM messages WHERE id = ?").get(messageId)
+      );
+    });
   }
 
   return {

@@ -4,6 +4,7 @@ services:
       context: ./backend
     environment:
       PORT: "5001"
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       SEARXNG_URL: ${DOCKER_SEARXNG_URL:-http://searxng:8080}
       OLLAMA_BASE_URL: ${DOCKER_OLLAMA_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-}

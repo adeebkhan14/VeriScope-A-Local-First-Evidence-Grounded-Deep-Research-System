@@ -263,6 +263,21 @@ export function createSearchRouter(
                 : typeof evidence?.snippet === "string"
                   ? evidence.snippet
                   : null,
+            evidenceId:
+              typeof evidence?.evidenceId === "string"
+                ? evidence.evidenceId
+                : null,
+            originalCreatedAt:
+              typeof evidence?.originalCreatedAt === "string"
+                ? evidence.originalCreatedAt
+                : typeof evidence?.createdAt === "string"
+                  ? evidence.createdAt
+                  : null,
+            originalResearchTurn:
+              typeof evidence?.originalResearchTurn === "string"
+                ? evidence.originalResearchTurn
+                : null,
+            reused: evidence?.reused === true,
           }))
         : [];
       const completed = conversationStore.updateMessage({
@@ -284,15 +299,12 @@ export function createSearchRouter(
       return completed;
     };
 
-    console.log("\n========================================");
-    console.log("API REQUEST");
-    console.log("========================================");
-    if (process.env.NODE_ENV === "production") {
-      console.log("Query length:", query.trim().length);
-    } else {
-      console.log("Query:", query.trim());
-    }
-    if (forceWebSearch) console.log("Force Web Search: true");
+    console.info("[Search] Research request started", {
+      requestId: req.requestId,
+      queryLength: query.trim().length,
+      forcedWeb: forceWebSearch,
+      streaming: wantsStream,
+    });
 
     try {
       if (!wantsStream) {

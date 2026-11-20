@@ -17,6 +17,7 @@ import {
   getOutputTokenLimit,
   getPromptTokenBudget,
 } from "./contextBudget.js";
+import { resolveConversationEntities } from "./entityResolution.js";
 
 const STOP_WORDS = new Set([
   "about", "after", "again", "also", "and", "are", "because", "before",
@@ -147,6 +148,19 @@ function normalizeHistoricalEvidence(assistantMessage) {
       url: reference.url,
       text: reference.snippet.trim(),
       score: null,
+      evidenceId: typeof reference.evidenceId === "string"
+        ? reference.evidenceId
+        : null,
+      createdAt: typeof reference.createdAt === "string"
+        ? reference.createdAt
+        : typeof reference.originalCreatedAt === "string"
+          ? reference.originalCreatedAt
+          : null,
+      originalResearchTurn:
+        typeof reference.originalResearchTurn === "string"
+          ? reference.originalResearchTurn
+          : null,
+      reused: Boolean(reference.reused),
     }));
 }
 
@@ -232,7 +246,32 @@ function findLatestEvidenceSet(exchanges, currentQuestion) {
 function isUnresolvedReference(question, hasHistory) {
   if (hasHistory || !REFERENTIAL_PATTERN.test(question)) return false;
   const words = question.trim().split(/\s+/);
-  return words.length <= 8 && /^(?:what|how|why|where|when|can|does|do|is|are)\b/i.test(question);
+  return words.length <= 8 &&
+    /^(?:what|how|why|where|when|can|could|does|do|is|are|explain|describe|simplify|summarize|rewrite|rephrase)\b/i.test(question);
+}
+
+function evidenceIsRelevantToResolvedQuestion(question, evidenceSet, entityResolution) {
+  if (!evidenceSet || !Array.isArray(evidenceSet.evidence) || evidenceSet.evidence.length === 0) {
+    return false;
+  }
+  const resolvedEntity = entityResolution?.resolvedEntity;
+  const evidenceText = evidenceSet.evidence
+    .map((item) => `${item.title || ""} ${item.text || ""} ${item.url || ""}`)
+    .join(" ")
+    .toLowerCase();
+  if (resolvedEntity && !evidenceText.includes(resolvedEntity.toLowerCase())) {
+    return false;
+  }
+  if (/\b(?:how long|for how long|tenure|held that position|since when)\b/i.test(question)) {
+    return /\b(?:chief executive since|ceo since|became ceo|appointed ceo|joined.*ceo|served as ceo|ceo for|tenure began|for \d+ years)\b/i.test(evidenceText);
+  }
+  if (/\b(?:why|what led|reason|departure|step down|resign)\b/i.test(question)) {
+    return /\b(?:step down|stepped down|resign|resigned|departure|reason|replace|left)\b/i.test(evidenceText);
+  }
+  const questionTerms = termsIn(question);
+  const evidenceTerms = termsIn(evidenceText);
+  const overlap = [...questionTerms].filter((term) => evidenceTerms.has(term)).length;
+  return overlap > 0;
 }
 
 export function routeResearchQuery(
@@ -241,12 +280,30 @@ export function routeResearchQuery(
 ) {
   const currentQuestion = typeof question === "string" ? question.trim() : "";
   const exchanges = completedExchanges(conversation);
+  const entityResolution = resolveConversationEntities(currentQuestion, conversation);
   const latestQuestion = latestCompletedUserQuestion(exchanges);
   const evidenceSet = findLatestEvidenceSet(exchanges, currentQuestion);
   const searchQuery = resolveSearchQuery(
     currentQuestion,
     evidenceSet?.sourceQuestion || latestQuestion
   );
+  const resolvedSearchQuery =
+    entityResolution.resolvedEntity && entityResolution.resolvedQuery !== currentQuestion
+      ? entityResolution.resolvedQuery
+      : searchQuery;
+
+  if (entityResolution.status === "ambiguous" && entityResolution.isFollowUp) {
+    return {
+      category: "ambiguous",
+      reason: "The follow-up is ambiguous because multiple people could be the subject.",
+      clarification:
+        "Who do you mean: which person from the previous discussion?",
+      resolvedQuery: currentQuestion,
+      searchQuery: currentQuestion,
+      sourceQuestion: latestQuestion,
+      entityResolution,
+    };
+  }
 
   if (
     forceWebSearch ||
@@ -257,8 +314,10 @@ export function routeResearchQuery(
       reason: forceWebSearch
         ? "Web research was explicitly requested."
         : "The question asks for current or freshly verified information.",
-      searchQuery,
+      resolvedQuery: resolvedSearchQuery,
+      searchQuery: resolvedSearchQuery,
       sourceQuestion: evidenceSet?.sourceQuestion || latestQuestion,
+      entityResolution,
     };
   }
 
@@ -280,22 +339,27 @@ export function routeResearchQuery(
     return {
       category: "conversation_only",
       reason: "The request only reformats or clarifies prior conversation content.",
-      searchQuery,
+      resolvedQuery: resolvedSearchQuery,
+      searchQuery: resolvedSearchQuery,
       sourceQuestion: latestQuestion,
+      entityResolution,
     };
   }
 
   if (
     evidenceSet &&
+    evidenceIsRelevantToResolvedQuestion(currentQuestion, evidenceSet, entityResolution) &&
     (REFERENTIAL_PATTERN.test(currentQuestion) ||
       EVIDENCE_FOLLOWUP_PATTERN.test(currentQuestion))
   ) {
     return {
       category: "existing_evidence",
       reason: "The follow-up refers to a prior research answer with stored source passages.",
-      searchQuery: resolveSearchQuery(currentQuestion, evidenceSet.sourceQuestion),
+      resolvedQuery: resolvedSearchQuery,
+      searchQuery: resolvedSearchQuery,
       sourceQuestion: evidenceSet.sourceQuestion,
       evidence: evidenceSet.evidence,
+      entityResolution,
     };
   }
 
@@ -303,16 +367,20 @@ export function routeResearchQuery(
     return {
       category: "local_knowledge",
       reason: "The question asks for a stable explanation or ordinary local response.",
-      searchQuery,
+      resolvedQuery: resolvedSearchQuery,
+      searchQuery: resolvedSearchQuery,
       sourceQuestion: latestQuestion,
+      entityResolution,
     };
   }
 
   return {
     category: "model_decision",
     reason: "Deterministic rules did not identify a safe route.",
-    searchQuery,
+    resolvedQuery: resolvedSearchQuery,
+    searchQuery: resolvedSearchQuery,
     sourceQuestion: evidenceSet?.sourceQuestion || latestQuestion,
+    entityResolution,
   };
 }
 
@@ -389,6 +457,8 @@ function withRouteMetadata(base, fields) {
     isFollowUp: fields.isFollowUp,
     requiresFreshEvidence: fields.requiresFreshEvidence,
     reusePreviousEvidence: fields.reusePreviousEvidence,
+    resolvedEntities: fields.resolvedEntities || [],
+    referenceResolution: fields.referenceResolution || "none",
   };
 }
 
@@ -402,6 +472,7 @@ export async function decideResearchRoute(
   { conversation = [], forceWebSearch = false, ollamaClient, signal, timeoutMs } = {}
 ) {
   const originalQuery = typeof question === "string" ? question.trim() : "";
+  const entityResolution = resolveConversationEntities(originalQuery, conversation);
   const deterministic = routeResearchQuery(originalQuery, {
     conversation,
     forceWebSearch,
@@ -410,9 +481,10 @@ export async function decideResearchRoute(
   const evidenceSet = findLatestEvidenceSet(exchanges, originalQuery);
   const relevantEvidence = selectRelevantHistoricalEvidence(conversation, originalQuery);
   const deterministicResolved =
-    deterministic.searchQuery && deterministic.searchQuery !== originalQuery
+    deterministic.resolvedQuery ||
+    (deterministic.searchQuery && deterministic.searchQuery !== originalQuery
       ? deterministic.searchQuery
-      : originalQuery;
+      : originalQuery);
 
   if (forceWebSearch) {
     return withRouteMetadata(deterministic, {
@@ -422,6 +494,8 @@ export async function decideResearchRoute(
       isFollowUp: exchanges.length > 0,
       requiresFreshEvidence: true,
       reusePreviousEvidence: false,
+      resolvedEntities: entityResolution.entities,
+      referenceResolution: entityResolution.status,
     });
   }
 
@@ -437,6 +511,8 @@ export async function decideResearchRoute(
       isFollowUp: exchanges.length > 0,
       requiresFreshEvidence: true,
       reusePreviousEvidence: false,
+      resolvedEntities: entityResolution.entities,
+      referenceResolution: entityResolution.status,
     });
   }
 
@@ -448,6 +524,8 @@ export async function decideResearchRoute(
       isFollowUp: false,
       requiresFreshEvidence: false,
       reusePreviousEvidence: false,
+      resolvedEntities: entityResolution.entities,
+      referenceResolution: "ambiguous",
     });
   }
 
@@ -469,6 +547,8 @@ export async function decideResearchRoute(
       isFollowUp: exchanges.length > 0,
       requiresFreshEvidence: false,
       reusePreviousEvidence: route === "REUSE",
+      resolvedEntities: entityResolution.entities,
+      referenceResolution: entityResolution.status,
     });
   }
 
@@ -548,10 +628,22 @@ Rules:
     ).trim().toUpperCase();
 
     if (parsed && ["LOCAL", "REUSE", "WEB", "HYBRID"].includes(parsed.route)) {
-      const resolvedQuery =
+      let resolvedQuery =
         typeof parsed.resolvedQuery === "string" && parsed.resolvedQuery.trim()
           ? parsed.resolvedQuery.trim()
           : originalQuery;
+      if (
+        entityResolution.resolvedEntity &&
+        !resolvedQuery.toLowerCase().includes(entityResolution.resolvedEntity.toLowerCase())
+      ) {
+        resolvedQuery = deterministicResolved;
+      }
+      if (
+        entityResolution.resolvedEntity &&
+        /\b(?:how long|for how long|tenure|held that position|since when)\b/i.test(originalQuery)
+      ) {
+        resolvedQuery = deterministicResolved;
+      }
       let route = parsed.route;
       if (route === "REUSE" && relevantEvidence.length === 0) route = "WEB";
       if (route === "HYBRID" && relevantEvidence.length === 0) route = "WEB";
@@ -563,12 +655,36 @@ Rules:
             : route === "HYBRID"
               ? "hybrid_research"
               : "new_research";
-      const selectedEvidence =
+      let selectedEvidence =
         route === "REUSE" || route === "HYBRID"
           ? relevantEvidence
           : [];
+      if (entityResolution.resolvedEntity) {
+        selectedEvidence = selectedEvidence.filter((item) =>
+          `${item.title || ""} ${item.text || ""} ${item.url || ""}`
+            .toLowerCase()
+            .includes(entityResolution.resolvedEntity.toLowerCase())
+        );
+      }
+      if (
+        /\b(?:how long|for how long|tenure|held that position|since when)\b/i.test(originalQuery)
+      ) {
+        selectedEvidence = selectedEvidence.filter((item) =>
+          /\b(?:chief executive since|ceo since|became ceo|appointed ceo|joined.*ceo|served as ceo|ceo for|tenure began|for \d+ years)\b/i
+            .test(`${item.title || ""} ${item.text || ""}`)
+        );
+      }
+      if (route === "REUSE" && selectedEvidence.length === 0) route = "WEB";
+      const finalizedCategory =
+        route === "LOCAL"
+          ? "local_knowledge"
+          : route === "REUSE"
+            ? "existing_evidence"
+            : route === "HYBRID"
+              ? "hybrid_research"
+              : "new_research";
       const result = {
-        category,
+        category: finalizedCategory,
         reason:
           typeof parsed.reason === "string" && parsed.reason.trim()
             ? parsed.reason.trim()
@@ -578,10 +694,11 @@ Rules:
         evidence: selectedEvidence,
       };
       console.info("[ResearchRouting] Per-turn decision", {
-        originalQuery,
-        resolvedQuery,
+        originalQueryLength: originalQuery.length,
+        resolvedQueryLength: resolvedQuery.length,
         route,
-        reason: result.reason,
+        requiresFreshEvidence: route === "WEB" || route === "HYBRID",
+        reusePreviousEvidence: route === "REUSE" || route === "HYBRID",
       });
       return withRouteMetadata(result, {
         originalQuery,
@@ -597,6 +714,8 @@ Rules:
           typeof parsed.reusePreviousEvidence === "boolean"
             ? route === "REUSE" || (route === "HYBRID" && parsed.reusePreviousEvidence)
             : route === "REUSE" || route === "HYBRID",
+        resolvedEntities: entityResolution.entities,
+        referenceResolution: entityResolution.status,
       });
     }
 

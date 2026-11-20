@@ -195,6 +195,7 @@ Rules:
 - related means it is about the topic but does not establish the claim.
 - If no passage supports a claim, use an empty evidence array. Never attach unrelated evidence just to avoid an unsupported claim.
 - A retrieval score is not proof of support.
+- For allegations, preserve whether the passage states a confirmed fact, reports an allegation, describes a suspicion, records a denial, or merely speculates. Relatedness alone is not support.
 - Do not return source metadata, scores, or explanations. The application resolves metadata from the retrieved chunks.
 - Return valid JSON only.
 
