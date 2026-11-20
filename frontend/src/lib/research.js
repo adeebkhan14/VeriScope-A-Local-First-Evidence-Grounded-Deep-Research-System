@@ -3,7 +3,6 @@
 
   Alpha keeps the backend's convention (research.js):
       hybridScore = alpha * BM25 + (1 - alpha) * semantic
-  so a HIGHER alpha is MORE keyword. Design.md puts Keyword on the left of the
   slider and Semantic on the right, so the slider position is the semantic
   weight (1 - alpha). Only this mapping lives here; the request still sends alpha.
 */
@@ -31,8 +30,8 @@ export function describeProgress(message) {
   if (typeof message !== 'string' || !message.trim()) return 'Working…'
   const text = message.trim()
 
-  const pages = /^Scraping (\d+) pages?/i.exec(text)
-  if (pages) return `Reading ${pages[1]} ${pages[1] === '1' ? 'page' : 'pages'}…`
+  const pages = /^Scraping(?: \d+) pages?/i.test(text)
+  if (pages) return 'Scraping pages…'
   if (/^Querying SearXNG/i.test(text)) return 'Searching the web…'
   if (/^Reranking/i.test(text)) return 'Ranking evidence…'
   if (/^Checking previous research/i.test(text)) return 'Checking earlier evidence…'

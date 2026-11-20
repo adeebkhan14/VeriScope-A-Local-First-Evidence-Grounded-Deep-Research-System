@@ -1,7 +1,6 @@
 import { Fragment } from 'react'
 import './StatusLine.css'
 
-// Existing /api/health fields mapped to the names Design.md uses.
 const SERVICES = [
   { key: 'ollama', label: 'Local AI' },
   { key: 'embedding', label: 'Retrieval' },
@@ -14,7 +13,7 @@ function describeService(service, label) {
   return { label: `${label} unavailable`, ok: false, detail: service?.error }
 }
 
-/** Small text-only status line built from real health data (Design.md §9). */
+/** Small text-only status line built from real health data. */
 export default function StatusLine({ health }) {
   if (!health) {
     return <p className="status-line">Checking systems…</p>

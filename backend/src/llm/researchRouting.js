@@ -1,3 +1,23 @@
+import {
+  OLLAMA_CONTEXT_LENGTH,
+  OLLAMA_KEEP_ALIVE,
+  OLLAMA_MODEL,
+  OLLAMA_REQUEST_TIMEOUT_MS,
+  OLLAMA_TEMPERATURE,
+  chatWithTimeout,
+  classifyOllamaError,
+} from "./ollamaClient.js";
+import ollama from "./ollamaClient.js";
+import {
+  buildConversationContext,
+  fitConversationContext,
+} from "./conversationContext.js";
+import {
+  estimateMessageTokens,
+  getOutputTokenLimit,
+  getPromptTokenBudget,
+} from "./contextBudget.js";
+
 const STOP_WORDS = new Set([
   "about", "after", "again", "also", "and", "are", "because", "before",
   "between", "could", "does", "from", "give", "have", "into", "more",
@@ -294,4 +314,345 @@ export function routeResearchQuery(
     searchQuery,
     sourceQuestion: evidenceSet?.sourceQuestion || latestQuestion,
   };
+}
+
+function normalizedModelText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map((entry) =>
+      typeof entry === "string"
+        ? entry
+        : entry?.text ?? entry?.content ?? entry?.value ?? ""
+    ).join(" ");
+  }
+  if (value && typeof value === "object") {
+    return value.text ?? value.content ?? value.message?.content ?? "";
+  }
+  return "";
+}
+
+function parseRouterJson(text) {
+  const cleaned = normalizedModelText(text)
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start === -1 || end <= start) return null;
+  try {
+    return JSON.parse(cleaned.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+export function selectRelevantHistoricalEvidence(conversation, question, limit = 4) {
+  const exchanges = completedExchanges(conversation);
+  const questionTerms = termsIn(question);
+  const candidates = [];
+
+  exchanges.forEach(([userMessage, assistantMessage], exchangeIndex) => {
+    normalizeHistoricalEvidence(assistantMessage).forEach((item, evidenceIndex) => {
+      const evidenceTerms = termsIn(`${item.title} ${item.url} ${item.text}`);
+      const overlap = [...questionTerms].filter((term) => evidenceTerms.has(term)).length;
+      const topicOverlap = [...termsIn(userMessage.content)].filter((term) =>
+        evidenceTerms.has(term)
+      ).length;
+      candidates.push({
+        item,
+        score: overlap * 4 + topicOverlap * 2 + (exchangeIndex === exchanges.length - 1 ? 1 : 0),
+        overlap,
+        exchangeIndex,
+        evidenceIndex,
+      });
+    });
+  });
+
+  candidates.sort(
+    (first, second) =>
+      second.score - first.score ||
+      second.exchangeIndex - first.exchangeIndex ||
+      first.evidenceIndex - second.evidenceIndex
+  );
+  return candidates
+    .filter((candidate) => candidate.overlap > 0)
+    .slice(0, limit)
+    .map(({ item }) => item);
+}
+
+function withRouteMetadata(base, fields) {
+  return {
+    ...base,
+    originalQuery: fields.originalQuery,
+    resolvedQuery: fields.resolvedQuery,
+    route: fields.route,
+    isFollowUp: fields.isFollowUp,
+    requiresFreshEvidence: fields.requiresFreshEvidence,
+    reusePreviousEvidence: fields.reusePreviousEvidence,
+  };
+}
+
+/**
+ * Per-turn intelligent routing. Deterministic rules remain authoritative for
+ * forced web search and explicit time-sensitive information. Qwen resolves
+ * follow-ups and validates ambiguous/relevant cases with a short JSON decision.
+ */
+export async function decideResearchRoute(
+  question,
+  { conversation = [], forceWebSearch = false, ollamaClient, signal, timeoutMs } = {}
+) {
+  const originalQuery = typeof question === "string" ? question.trim() : "";
+  const deterministic = routeResearchQuery(originalQuery, {
+    conversation,
+    forceWebSearch,
+  });
+  const exchanges = completedExchanges(conversation);
+  const evidenceSet = findLatestEvidenceSet(exchanges, originalQuery);
+  const relevantEvidence = selectRelevantHistoricalEvidence(conversation, originalQuery);
+  const deterministicResolved =
+    deterministic.searchQuery && deterministic.searchQuery !== originalQuery
+      ? deterministic.searchQuery
+      : originalQuery;
+
+  if (forceWebSearch) {
+    return withRouteMetadata(deterministic, {
+      originalQuery,
+      resolvedQuery: deterministicResolved,
+      route: "WEB",
+      isFollowUp: exchanges.length > 0,
+      requiresFreshEvidence: true,
+      reusePreviousEvidence: false,
+    });
+  }
+
+  if (requiresFreshResearch(originalQuery)) {
+    return withRouteMetadata({
+      ...deterministic,
+      category: "new_research",
+      reason: "Fresh verification is required by explicit time-sensitive rules.",
+    }, {
+      originalQuery,
+      resolvedQuery: deterministicResolved,
+      route: "WEB",
+      isFollowUp: exchanges.length > 0,
+      requiresFreshEvidence: true,
+      reusePreviousEvidence: false,
+    });
+  }
+
+  if (deterministic.category === "ambiguous") {
+    return withRouteMetadata(deterministic, {
+      originalQuery,
+      resolvedQuery: originalQuery,
+      route: "LOCAL",
+      isFollowUp: false,
+      requiresFreshEvidence: false,
+      reusePreviousEvidence: false,
+    });
+  }
+
+  if (
+    deterministic.category === "conversation_only" ||
+    deterministic.category === "existing_evidence" ||
+    deterministic.category === "local_knowledge"
+  ) {
+    const route =
+      deterministic.category === "existing_evidence"
+        ? "REUSE"
+        : deterministic.category === "conversation_only"
+          ? "LOCAL"
+          : "LOCAL";
+    return withRouteMetadata(deterministic, {
+      originalQuery,
+      resolvedQuery: deterministicResolved,
+      route,
+      isFollowUp: exchanges.length > 0,
+      requiresFreshEvidence: false,
+      reusePreviousEvidence: route === "REUSE",
+    });
+  }
+
+  const evidenceSummary = relevantEvidence.slice(0, 4).map((item, index) => ({
+    index: index + 1,
+    title: item.title,
+    domain: (() => {
+      try { return new URL(item.url).hostname.replace(/^www\./, ""); }
+      catch { return ""; }
+    })(),
+    snippet: item.text.slice(0, 300),
+  }));
+  const recentMessages = buildConversationContext(conversation, {
+    currentQuestion: originalQuery,
+    tokenBudget: 1600,
+  });
+  const systemMessage = {
+    role: "system",
+    content: `You are VeriScope's per-turn routing assistant. Resolve the current question using prior conversation only, then decide whether it needs LOCAL knowledge, REUSE of relevant prior evidence, fresh WEB research, or HYBRID evidence.
+
+Return only a JSON object with exactly these keys:
+{"route":"LOCAL|REUSE|WEB|HYBRID","isFollowUp":true,"resolvedQuery":"...","reason":"short reason","requiresFreshEvidence":true,"reusePreviousEvidence":false}
+
+Rules:
+- Preserve the original meaning; do not add assumptions or entities.
+- Prefer LOCAL for stable conceptual questions.
+- Prefer REUSE only when existing passages directly and explicitly answer the request.
+- Prefer WEB for latest/current/time-sensitive facts, leadership, versions, prices, announcements, or uncertain recent specifics.
+- Prefer HYBRID when prior context is needed and fresh external evidence is also necessary.
+- If uncertain about evidence sufficiency, prefer WEB.
+- Do not include chain-of-thought or markdown.`,
+  };
+  const currentMessage = {
+    role: "user",
+    content: JSON.stringify({
+      originalQuery,
+      evidenceAvailable: evidenceSummary,
+    }),
+  };
+  const fittedContext = fitConversationContext(recentMessages, {
+    systemMessage,
+    currentMessage,
+    maxPromptTokens: getPromptTokenBudget(),
+  });
+  const promptTokenCount = estimateMessageTokens(fittedContext.messages);
+  const outputTokenLimit = getOutputTokenLimit(promptTokenCount, {
+    maxOutputTokens: 180,
+    minimumOutputTokens: 40,
+  });
+
+  try {
+    const client = ollamaClient || ollama;
+    const response = await chatWithTimeout(
+      client,
+      {
+        model: OLLAMA_MODEL,
+        think: false,
+        messages: fittedContext.messages,
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        stream: false,
+        options: {
+          num_ctx: OLLAMA_CONTEXT_LENGTH,
+          num_predict: outputTokenLimit,
+          temperature: 0,
+        },
+      },
+      {
+        signal,
+        timeoutMs: timeoutMs ?? OLLAMA_REQUEST_TIMEOUT_MS,
+      }
+    );
+    const parsed = parseRouterJson(
+      normalizedModelText(response?.message?.content ?? response?.content)
+    );
+    const rawLabel = normalizedModelText(
+      response?.message?.content ?? response?.content
+    ).trim().toUpperCase();
+
+    if (parsed && ["LOCAL", "REUSE", "WEB", "HYBRID"].includes(parsed.route)) {
+      const resolvedQuery =
+        typeof parsed.resolvedQuery === "string" && parsed.resolvedQuery.trim()
+          ? parsed.resolvedQuery.trim()
+          : originalQuery;
+      let route = parsed.route;
+      if (route === "REUSE" && relevantEvidence.length === 0) route = "WEB";
+      if (route === "HYBRID" && relevantEvidence.length === 0) route = "WEB";
+      const category =
+        route === "LOCAL"
+          ? "local_knowledge"
+          : route === "REUSE"
+            ? "existing_evidence"
+            : route === "HYBRID"
+              ? "hybrid_research"
+              : "new_research";
+      const selectedEvidence =
+        route === "REUSE" || route === "HYBRID"
+          ? relevantEvidence
+          : [];
+      const result = {
+        category,
+        reason:
+          typeof parsed.reason === "string" && parsed.reason.trim()
+            ? parsed.reason.trim()
+            : "The local model selected this per-turn route.",
+        searchQuery: resolvedQuery,
+        sourceQuestion: latestCompletedUserQuestion(exchanges),
+        evidence: selectedEvidence,
+      };
+      console.info("[ResearchRouting] Per-turn decision", {
+        originalQuery,
+        resolvedQuery,
+        route,
+        reason: result.reason,
+      });
+      return withRouteMetadata(result, {
+        originalQuery,
+        resolvedQuery,
+        route,
+        isFollowUp:
+          typeof parsed.isFollowUp === "boolean"
+            ? parsed.isFollowUp
+            : exchanges.length > 0,
+        requiresFreshEvidence:
+          route === "WEB" || route === "HYBRID",
+        reusePreviousEvidence:
+          typeof parsed.reusePreviousEvidence === "boolean"
+            ? route === "REUSE" || (route === "HYBRID" && parsed.reusePreviousEvidence)
+            : route === "REUSE" || route === "HYBRID",
+      });
+    }
+
+    if (rawLabel === "LOCAL_KNOWLEDGE") {
+      return withRouteMetadata({
+        category: "local_knowledge",
+        reason: "The local model classified this stable question for local answering.",
+        searchQuery: originalQuery,
+        sourceQuestion: latestCompletedUserQuestion(exchanges),
+      }, {
+        originalQuery,
+        resolvedQuery: originalQuery,
+        route: "LOCAL",
+        isFollowUp: exchanges.length > 0,
+        requiresFreshEvidence: false,
+        reusePreviousEvidence: false,
+      });
+    }
+    if (rawLabel === "WEB_RESEARCH") {
+      return withRouteMetadata({
+        category: "new_research",
+        reason: "The local model classified this question as requiring fresh research.",
+        searchQuery: originalQuery,
+        sourceQuestion: latestCompletedUserQuestion(exchanges),
+      }, {
+        originalQuery,
+        resolvedQuery: deterministicResolved,
+        route: "WEB",
+        isFollowUp: exchanges.length > 0,
+        requiresFreshEvidence: true,
+        reusePreviousEvidence: false,
+      });
+    }
+  } catch (error) {
+    if (signal?.aborted || error?.name === "AbortError") throw error;
+    console.warn("[ResearchRouting] Structured routing unavailable; using safe fallback.", {
+      code: classifyOllamaError(error).code,
+    });
+  }
+
+  const fallback = {
+    category: "new_research",
+    reason: "Routing output was malformed or unavailable; conservative fresh research was selected.",
+    searchQuery: deterministicResolved,
+    sourceQuestion: latestCompletedUserQuestion(exchanges),
+  };
+  console.warn("[ResearchRouting] Per-turn fallback", {
+    originalQuery,
+    route: "WEB",
+  });
+  return withRouteMetadata(fallback, {
+    originalQuery,
+    resolvedQuery: deterministicResolved,
+    route: "WEB",
+    isFollowUp: exchanges.length > 0,
+    requiresFreshEvidence: true,
+    reusePreviousEvidence: false,
+  });
 }

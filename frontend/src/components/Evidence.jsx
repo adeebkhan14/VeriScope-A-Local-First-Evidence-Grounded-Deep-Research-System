@@ -49,7 +49,6 @@ function EvidenceCard({ messageId, item, cited, open, flash, onToggle }) {
   )
 }
 
-/** Compact, expandable evidence for one answer (Design.md §8). Collapsed by default; the answer stays primary. */
 export default function EvidenceSection({
   messageId,
   items,

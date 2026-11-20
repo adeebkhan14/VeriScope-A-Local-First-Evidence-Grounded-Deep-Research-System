@@ -1,4 +1,3 @@
-/* Assistant Markdown. Sizes follow Design.md §11. */
 .md {
   font-size: 15.5px;
   line-height: 1.7;
@@ -181,7 +180,6 @@
   background: var(--hover);
 }
 
-/* Syntax highlighting: monochrome, so it follows the active theme (Design.md §10). */
 .hljs-comment,
 .hljs-quote {
   color: var(--text-2);

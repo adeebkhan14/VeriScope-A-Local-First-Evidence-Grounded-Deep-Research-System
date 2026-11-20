@@ -17,7 +17,11 @@ import {
 } from "./llm/ollama.js";
 import { evaluateEvidenceSufficiency } from "./llm/evidenceJudge.js";
 import { attributeClaims } from "./llm/evidenceAttribution.js";
-import { routeResearchQuery } from "./llm/researchRouting.js";
+import {
+  decideResearchRoute,
+  routeResearchQuery,
+  selectRelevantHistoricalEvidence,
+} from "./llm/researchRouting.js";
 import {
   buildConversationContext,
   fitConversationContext,
@@ -128,13 +132,24 @@ export async function research(query, options = {}) {
     error.code = "ABORT_ERR";
     throw error;
   }
-  let route = routeResearchQuery(query, {
+  let route = await decideResearchRoute(query, {
     conversation: options.conversation,
     forceWebSearch,
+    ollamaClient,
+    signal: options.signal,
   });
+  const originalQuery = route.originalQuery || query.trim();
+  query =
+    route.category === "existing_evidence" ||
+    route.category === "conversation_only" ||
+    route.category === "local_knowledge"
+      ? originalQuery
+      : route.resolvedQuery || originalQuery;
   if (route.category === "ambiguous") {
     return {
       query,
+      originalQuery,
+      resolvedQuery: route.resolvedQuery || originalQuery,
       sessionId,
       answer: route.clarification,
       citations: [],
@@ -144,6 +159,10 @@ export async function research(query, options = {}) {
       answeredByLLM: false,
       searchedWeb: false,
       researchMetadata: {
+        originalQuery,
+        resolvedQuery: route.resolvedQuery || originalQuery,
+        routingDecision: "LOCAL",
+        routingReason: route.reason,
         routeCategory: route.category,
         historicalMessagesAvailable: Array.isArray(options.conversation)
           ? options.conversation.length
@@ -212,6 +231,13 @@ export async function research(query, options = {}) {
     generationTimeMs = null,
     contextDiagnostics = null,
   } = {}) => ({
+    originalQuery,
+    resolvedQuery: route.resolvedQuery || originalQuery,
+    routingDecision: route.route || null,
+    routingReason: route.reason || null,
+    isFollowUp: route.isFollowUp || false,
+    requiresFreshEvidence: route.requiresFreshEvidence || false,
+    reusePreviousEvidence: route.reusePreviousEvidence || false,
     routeCategory: route.category,
     depth: researchSettings.depth,
     alpha: researchSettings.alpha,
@@ -339,6 +365,8 @@ export async function research(query, options = {}) {
       } else if (!evaluation.sufficient) {
         return {
           query,
+          originalQuery,
+          resolvedQuery: route.resolvedQuery || originalQuery,
           sessionId,
           answer:
             "Not enough evidence. Evidence verification could not be completed at this time.",
@@ -379,6 +407,8 @@ export async function research(query, options = {}) {
         }
         return {
           query,
+          originalQuery,
+          resolvedQuery: route.resolvedQuery || originalQuery,
           sessionId,
           answer: generation.answer,
           citations,
@@ -450,6 +480,8 @@ export async function research(query, options = {}) {
       );
       return {
         query,
+        originalQuery,
+        resolvedQuery: route.resolvedQuery || originalQuery,
         answer: directResult.answer,
         sessionId,
         citations: [],
@@ -485,7 +517,7 @@ export async function research(query, options = {}) {
   }
 
   const responseMode = route.category;
-  if (responseMode !== "new_research") {
+  if (responseMode !== "new_research" && responseMode !== "hybrid_research") {
     throw new Error(`Unsupported finalized research route: ${responseMode}`);
   }
   console.log(
@@ -504,6 +536,8 @@ export async function research(query, options = {}) {
   if (searchResults.length === 0) {
     return {
       query,
+      originalQuery,
+      resolvedQuery: route.resolvedQuery || originalQuery,
       sessionId,
       answer:
         "Not enough evidence. The web search returned 0 results for your query. Try broadening your terms or using different keywords.",
@@ -518,7 +552,7 @@ export async function research(query, options = {}) {
         missing: "All requested information is missing because no web pages were found.",
         status: "insufficient",
       },
-      source: "web_search",
+      source: route.category === "hybrid_research" ? "hybrid_research" : "web_search",
       answeredByLLM: false,
       searchedWeb: true,
       warnings: [...warnings, "SearXNG returned no search results."],
@@ -614,7 +648,7 @@ export async function research(query, options = {}) {
         missing: "All requested information is missing because web page content could not be read.",
         status: "insufficient",
       },
-      source: "web_search",
+      source: route.category === "hybrid_research" ? "hybrid_research" : "web_search",
       answeredByLLM: false,
       searchedWeb: true,
       warnings: [
@@ -671,7 +705,7 @@ export async function research(query, options = {}) {
         missing: "All requested information is missing.",
         status: "insufficient",
       },
-      source: "web_search",
+      source: route.category === "hybrid_research" ? "hybrid_research" : "web_search",
       answeredByLLM: false,
       searchedWeb: true,
       researchMetadata: createResearchMetadata(),
@@ -780,6 +814,33 @@ export async function research(query, options = {}) {
   // 7. BUILD EVIDENCE PACKAGE
   // ========================================
   const evidencePackage = buildEvidencePackage(query, budgetedEvidence);
+  if (route.category === "hybrid_research" && Array.isArray(route.evidence)) {
+    const oldEvidence = selectEvidenceWithinBudget(
+      route.evidence,
+      researchSettings.topK,
+      Math.floor(effectiveEvidenceTokenBudget / 3)
+    );
+    if (oldEvidence.length > 0) {
+      const freshEvidence = evidencePackage.evidence;
+      const combinedEvidence = [
+        ...freshEvidence,
+        ...oldEvidence.map((item) => ({
+          id: null,
+          chunkId: Number.isInteger(item.chunkId)
+            ? item.chunkId
+            : Number.isInteger(item.id)
+              ? item.id
+              : null,
+          title: item.title,
+          sourceTitle: item.sourceTitle || item.title,
+          url: item.url,
+          text: item.text,
+          score: typeof item.score === "number" ? item.score : 0,
+        })),
+      ].map((item, index) => ({ ...item, id: index + 1 }));
+      evidencePackage.evidence = combinedEvidence;
+    }
+  }
   const researchMetadata = createResearchMetadata({
     retrievedChunkCount: rankedCandidates.length,
     chunksSent: evidencePackage.evidence.length,
@@ -845,7 +906,7 @@ export async function research(query, options = {}) {
       },
       llmError: evaluation.llmError,
       missingEvidence: evaluation.missing || evaluation.reason,
-      source: "web_search",
+      source: route.category === "hybrid_research" ? "hybrid_research" : "web_search",
       answeredByLLM: false,
       searchedWeb: true,
       warnings: warnings.length > 0 ? warnings : undefined,
@@ -890,6 +951,8 @@ export async function research(query, options = {}) {
 
   return {
     query,
+    originalQuery,
+    resolvedQuery: route.resolvedQuery || originalQuery,
     sessionId,
     answer: generation.answer,
     citations,
@@ -908,7 +971,7 @@ export async function research(query, options = {}) {
     missingEvidence: generation.isInsufficientEvidence
       ? "Generation detected remaining gaps in retrieved sources."
       : null,
-    source: "web_search",
+    source: route.category === "hybrid_research" ? "hybrid_research" : "web_search",
     answeredByLLM: false,
     searchedWeb: true,
     warnings: resultWarnings.length > 0 ? resultWarnings : undefined,

@@ -8,7 +8,6 @@ const THEMES = [
   { value: 'dark', label: 'Dark', Icon: MoonIcon },
 ]
 
-/** Sidebar settings entry. Theme lives here (Design.md §13). */
 export default function SettingsMenu({ theme, onThemeChange }) {
   const [open, setOpen] = useState(false)
   const wrapperRef = useRef(null)
