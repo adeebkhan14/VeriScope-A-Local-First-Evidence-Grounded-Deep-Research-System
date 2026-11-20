@@ -1,962 +1,642 @@
-# VeriScope --- Local-First Evidence-Grounded Deep Research System
+<div align="center">
 
-VeriScope is a local-first research system that searches the web,
-extracts webpage content, retrieves relevant evidence using lexical +
-semantic search, and generates a grounded answer using a locally running
-Qwen 3.5 9B model.
+<img src="./frontend/public/favicon.svg" alt="VeriScope Logo" width="72" height="72" />
 
-The current architecture is:
+<h1>VeriScope</h1>
 
-``` text
-React UI
-   ↓
-Express Backend
-   ↓
-Research Pipeline
-   ├── SearXNG → web discovery
-   ├── Axios + Cheerio → webpage extraction
-   ├── Playwright → JS-heavy webpage fallback
-   ├── Chunking
-   ├── BM25 → lexical retrieval
-   ├── MiniLM → semantic embeddings
-   ├── Hybrid retrieval
-   ├── Evidence selection
-   └── Ollama + Qwen 3.5 9B → grounded answer
+<p><strong>Research you can verify. Intelligence you can run locally.</strong></p>
+
+<p>
+  VeriScope is a local-first AI deep research system that combines self-hosted web discovery,
+  hybrid semantic and lexical retrieval, strict evidence-sufficiency gating, and local LLM inference
+  to produce traceable, citation-grounded answers.
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/Node.js-22+-0f172a?style=flat-square&logo=nodedotjs&logoColor=38bdf8" alt="Node.js 22+" />
+  <img src="https://img.shields.io/badge/React-19-0f172a?style=flat-square&logo=react&logoColor=38bdf8" alt="React 19" />
+  <img src="https://img.shields.io/badge/Express-5-0f172a?style=flat-square&logo=express&logoColor=ffffff" alt="Express 5" />
+  <img src="https://img.shields.io/badge/Ollama-Qwen%203.5%209B-0f172a?style=flat-square&logo=ollama&logoColor=38bdf8" alt="Ollama Qwen 3.5 9B" />
+  <img src="https://img.shields.io/badge/SearXNG-Self--Hosted-0f172a?style=flat-square&logo=searxng&logoColor=38bdf8" alt="SearXNG" />
+  <img src="https://img.shields.io/badge/FastAPI-MiniLM--L6--v2-0f172a?style=flat-square&logo=fastapi&logoColor=38bdf8" alt="FastAPI MiniLM" />
+  <img src="https://img.shields.io/badge/SQLite-WAL%20Mode-0f172a?style=flat-square&logo=sqlite&logoColor=38bdf8" alt="SQLite" />
+  <img src="https://img.shields.io/badge/Docker-Compose-0f172a?style=flat-square&logo=docker&logoColor=38bdf8" alt="Docker Compose" />
+</p>
+
+<p>
+  <a href="#project-overview">Overview</a> •
+  <a href="#key-features">Features</a> •
+  <a href="#system-architecture">Architecture</a> •
+  <a href="#research-pipeline">Pipeline</a> •
+  <a href="#installation-and-setup">Setup</a> •
+  <a href="#api-documentation">API</a> •
+  <a href="#roadmap">Roadmap</a>
+</p>
+
+</div>
+
+---
+
+## Table of Contents
+
+- [Project Overview](#project-overview)
+- [Key Features](#key-features)
+- [System Architecture](#system-architecture)
+  - [A. High-Level System Architecture](#a-high-level-system-architecture)
+  - [B. Detailed Research Pipeline](#b-detailed-research-pipeline)
+  - [C. Query Routing and Follow-Up Workflow](#c-query-routing-and-follow-up-workflow)
+  - [D. Data Persistence Architecture](#d-data-persistence-architecture)
+- [Research Pipeline](#research-pipeline)
+- [Technology Stack](#technology-stack)
+- [Project Structure](#project-structure)
+- [Installation and Setup](#installation-and-setup)
+- [Configuration](#configuration)
+- [API Documentation](#api-documentation)
+- [Security and Privacy](#security-and-privacy)
+- [Performance and Evaluation](#performance-and-evaluation)
+- [Screenshots and Demonstration](#screenshots-and-demonstration)
+- [Roadmap](#roadmap)
+- [Contributing and License](#contributing-and-license)
+
+---
+
+## Project Overview
+
+Conventional LLM interfaces blur the boundary between pretrained parametric memory and verified external facts. This creates five recurring failure modes in research workflows:
+
+1. **Confident Hallucinations:** Models fabricate facts or citations when asked about recent events, software versions, or niche technical details.
+2. **Opaque Provenance:** Answers rarely separate what was retrieved from what was inferred, making independent verification slow.
+3. **Cloud Lock-In:** Sending research queries and conversation histories to third-party APIs introduces recurring costs and external data retention.
+4. **Unvalidated Retrieval:** Standard RAG pipelines pass top-K chunks directly to generation even when those chunks do not actually answer the question.
+5. **Broken Multi-Turn Context:** Follow-up questions either lose entity context or pollute new topics with stale sources from earlier turns.
+
+**VeriScope** addresses these problems by treating the local language model (`qwen3.5:9b` via Ollama) as a **synthesis and evaluation engine—not the source of truth**:
+
+- **Local-First Execution:** LLM inference, semantic embeddings (`all-MiniLM-L6-v2`), lexical indexing (BM25), and conversation storage (SQLite) run locally on your hardware.
+- **Per-Turn Query Intelligence:** Deterministic rules and entity resolution decide whether a turn needs local knowledge, conversation reformulation, reuse of prior verified evidence, fresh web search, or a hybrid of both.
+- **Fail-Closed Evidence Gating:** Before generating a grounded answer, an independent evaluator checks whether the retrieved passages explicitly support all parts of the query. If evidence is insufficient or verification fails, VeriScope refuses to guess.
+- **Traceable Citations & Claim Attribution:** Generated answers enforce `[Source N]` citations, strip hallucinated source IDs, and map individual factual claims back to verbatim passages in the retrieved chunks.
+
+---
+
+## Key Features
+
+### Implemented Capabilities
+
+| Category | Feature | Implementation Details |
+| :--- | :--- | :--- |
+| **Local Inference** | **Ollama + Qwen 3.5 9B** | Local streaming inference (`stream: true`, `think: false`) with configurable context length (`4096` default), `keep_alive`, and dynamic output token budgeting. |
+| **Web Discovery** | **Self-Hosted SearXNG** | Metasearch via local SearXNG JSON API backed by Valkey caching, URL normalization, and tracking-parameter stripping. |
+| **Content Extraction** | **Parallel Scraping + Fallbacks** | Concurrent Axios + Cheerio extraction (max 3 concurrent, 5 pages, 6,000 chars/page) with SSRF protection, optional Playwright headless fallback, and SearXNG snippet fallback. |
+| **Hybrid Retrieval** | **BM25 + MiniLM-L6-v2** | Lexical scoring via `wink-bm25-text-search` fused with cosine similarity from a local FastAPI `sentence-transformers` microservice. Gracefully falls back to BM25 if MiniLM is offline. |
+| **Tunable Controls** | **Depth Presets & Alpha Slider** | UI controls for research depth (`FAST`, `NORMAL`, `MAX`), hybrid retrieval weight ($\alpha \in [0.1, 0.9]$), and forced web search (`Web: auto` / `Web: always`). |
+| **Verification** | **Evidence Sufficiency Gate** | Strict JSON evaluator (`evidenceJudge.js`) that ignores pretrained knowledge and fails closed when passages are vague, partial, or off-topic. |
+| **Grounding** | **Citation Sanitization & Claim Mapping** | Filters hallucinated `[Source N]` markers (`validateAndSanitizeCitations`) and maps factual claims to verbatim source quotes (`attributeClaims`). |
+| **Multi-Turn Memory** | **Entity Resolution & Context Budgeting** | Resolves follow-up pronouns (`entityResolution.js`), maintains rolling SQLite conversation summaries, and fits history + evidence within the safe token budget. |
+| **Persistence** | **SQLite (WAL Mode)** | Built-in `node:sqlite` (`DatabaseSync`) stores conversations, messages, research run metadata, evidence references, and summaries in `backend/data/veriscope.db`. |
+| **Streaming UX** | **Server-Sent Events (SSE)** | Real-time pipeline progress (`status`), token streaming (`token`), clickable inline citation chips, collapsible evidence cards, and system health polling. |
+
+---
+
+## System Architecture
+
+### A. High-Level System Architecture
+
+VeriScope runs as a multi-service Docker Compose stack (or natively for development) communicating with a host-native Ollama instance. On Linux, `compose.linux.yaml` adds a loopback-preserving `ollama-bridge` bound strictly to the Docker bridge interface.
+
+```mermaid
+flowchart TB
+    User(["User Browser"])
+
+    subgraph Compose["Docker Compose Network"]
+        direction TB
+        FE["React 19 + Vite UI<br/>(Nginx :5173 -> :80)"]
+        BE["Node.js 22 / Express 5 API<br/>(:5001)<br/>Serialized Research Queue"]
+        SQLite[("SQLite DB (WAL)<br/>backend/data/veriscope.db")]
+        Emb["FastAPI Embedding Service<br/>all-MiniLM-L6-v2 (:8000)"]
+        SX["SearXNG Metasearch<br/>(:8080)"]
+        VK[("Valkey Cache<br/>(:6379 internal)")]
+    end
+
+    subgraph Host["Native Host Machine"]
+        Bridge["Linux Ollama Bridge<br/>(compose.linux.yaml only)"]
+        Ollama["Ollama Server (:11434)<br/>qwen3.5:9b"]
+    end
+
+    Web(("External Websites &<br/>Search Engines"))
+
+    User <-->|"HTTP / SSE Stream"| FE
+    FE <-->|"/api/* Proxy"| BE
+    BE <-->|"node:sqlite"| SQLite
+    BE <-->|"POST /embed"| Emb
+    BE <-->|"GET /search?format=json"| SX
+    SX <-->|"Cache / State"| VK
+    SX <-->|"Search Queries"| Web
+    BE -->|"SSRF-Checked HTTP Scrape"| Web
+    BE <-->|"host.docker.internal:11434"| Ollama
+    BE -.->|"Linux Bridge Forward"| Bridge
+    Bridge -.->|"127.0.0.1:11434"| Ollama
 ```
 
-Completed research results are stored in the browser's local IndexedDB
-database. The research library supports full-text search over saved
-questions and answers, saved-result filtering, reopening, copying answer
-text, deleting individual entries, and clearing the local library. This
-browser storage is not sent to the backend or synchronized across devices.
+### B. Detailed Research Pipeline
 
-------------------------------------------------------------------------
+When a query is routed to web or hybrid research, the backend executes a deterministic retrieval and verification pipeline before generating the final response.
 
-# 1. Prerequisites
+```mermaid
+flowchart TD
+    Q["1. User Query & Resolved Search Query"] --> SX["2. SearXNG Discovery<br/>(Up to 12 raw -> SSRF check -> 5 unique URLs)"]
+    SX --> SC["3. Parallel Scraping (Concurrency: 3)<br/>Axios + Cheerio -> Snippet Fallback"]
+    SC --> CH["4. Chunking & Deduplication<br/>1000 chars / 200 overlap -> Jaccard >= 0.7 filter"]
+    CH --> BM25["5. BM25 Lexical Index<br/>wink-bm25-text-search -> Top 20 Candidates"]
 
-The same Docker Compose project runs on macOS and Windows with Docker
-Desktop. Ollama and Qwen 3.5 9B remain native host prerequisites; SearXNG,
-the frontend, backend, and MiniLM run in Compose.
+    BM25 --> EMB{"6. MiniLM Embedding Service<br/>Available?"}
+    EMB -->|"Yes"| SEM["all-MiniLM-L6-v2 Embeddings<br/>+ Cosine Similarity"]
+    EMB -->|"No (Graceful Fallback)"| BM25Only["Use Normalized BM25 Only"]
 
-You need:
+    SEM --> HYB["7. Min-Max Normalization & Hybrid Fusion<br/>Score = α·BM25 + (1 − α)·Semantic"]
+    BM25Only --> DIV
+    HYB --> DIV["8. Deduplicate (0.65) & Source Diversification<br/>Max 2 chunks/URL + Token Budget Cap"]
 
-- Docker Engine (Docker Desktop on macOS/Windows)
-- Ollama installed on the host
-- The `qwen3.5:9b` model downloaded in Ollama
-- Node.js, npm, and Python 3 only for native/manual development
+    DIV --> GATE{"9. Evidence Sufficiency Gate<br/>(evidenceJudge.js)"}
+    GATE -->|"Insufficient / Failed"| FAIL["Fail Closed<br/>Return Missing Evidence Details"]
+    GATE -->|"Sufficient"| GEN["10. Grounded Generation (Ollama)<br/>Stream Tokens + [Source N] Citations"]
 
-## Ubuntu/Linux startup
+    GEN --> SAN["11. Citation Sanitization<br/>Strip Hallucinated Source IDs"]
+    SAN --> ATTR["12. Claim-to-Evidence Attribution<br/>Verify Verbatim Chunk Quotes"]
+    ATTR --> OUT["13. Final Answer + Evidence Cards -> React UI"]
+```
 
-On Ubuntu, Docker Engine can run the SearXNG and MiniLM containers while
-the frontend and backend run natively. This keeps Ollama on its default
-loopback-only listener, which containers cannot reach through
-`host.docker.internal` on Linux.
+### C. Query Routing and Follow-Up Workflow
 
-Make sure Docker Engine is running and your account can access it. If you
-were just added to the `docker` group, sign out and back in, or run
-`newgrp docker` in the terminal you use below. Install Node.js 22 or
-newer and Ollama, then download the model with `ollama run qwen3.5:9b`.
+Every turn passes through `decideResearchRoute` (`researchRouting.js`) and `resolveConversationEntities` (`entityResolution.js`) before deciding whether to invoke web retrieval.
 
-From the project root, create a private SearXNG secret and start the
-containerized services:
+```mermaid
+flowchart TD
+    Start["Incoming Message + SQLite History"] --> Ent["Entity & Reference Resolution<br/>(Pronouns, People, Organizations)"]
+    Ent --> Force{"forceWebSearch<br/>enabled?"}
+    Force -->|"Yes"| Web["Route: WEB<br/>(new_research)"]
+    Force -->|"No"| Fresh{"Time-Sensitive /<br/>Freshness Rule?"}
+    Fresh -->|"Yes"| Web
+    Fresh -->|"No"| Amb{"Ambiguous<br/>Reference?"}
+    Amb -->|"Yes"| Clarify["Return Clarification<br/>Question (No Web/LLM)"]
+    Amb -->|"No"| Trans{"Reformulation /<br/>Summary Request?"}
+    Trans -->|"Yes"| ConvOnly["Route: LOCAL<br/>(conversation_only)"]
+    Trans -->|"No"| Reuse{"Relevant Prior<br/>Evidence Exists?"}
+    Reuse -->|"Yes"| GateReuse{"Prior Evidence<br/>Sufficient?"}
+    GateReuse -->|"Yes"| Existing["Generate from<br/>Existing Evidence"]
+    GateReuse -->|"No"| Web
+    Reuse -->|"No"| LocalRule{"Stable Conceptual<br/>Query?"}
+    LocalRule -->|"Yes"| Local["Route: LOCAL<br/>(local_knowledge)"]
+    LocalRule -->|"No"| ModelDec["Local LLM Router<br/>(LOCAL / REUSE / WEB / HYBRID)"]
+    ModelDec --> Local
+    ModelDec --> Existing
+    ModelDec --> Web
+    ModelDec --> Hybrid["Route: HYBRID<br/>(Fresh Web + Prior Evidence)"]
+```
 
-```sh
+### D. Data Persistence Architecture
+
+Conversation state, evidence provenance, and rolling summaries are persisted locally in SQLite (`backend/data/veriscope.db`) with foreign-key cascading enabled.
+
+```mermaid
+erDiagram
+    conversations ||--o{ messages : contains
+    conversations ||--o{ research_runs : logs
+    conversations ||--o{ evidence_references : stores
+    conversations ||--o| conversation_summaries : summarizes
+    conversations ||--o| conversation_summary_failures : tracks
+    messages ||--o{ research_runs : triggers
+    messages ||--o{ evidence_references : cites
+
+    conversations {
+        TEXT id PK
+        TEXT title
+        TEXT created_at
+        TEXT updated_at
+    }
+    messages {
+        TEXT id PK
+        TEXT conversation_id FK
+        TEXT role
+        TEXT content
+        TEXT status
+        TEXT created_at
+    }
+    research_runs {
+        TEXT id PK
+        TEXT conversation_id FK
+        TEXT message_id FK
+        TEXT query
+        TEXT created_at
+        TEXT metadata
+    }
+    evidence_references {
+        TEXT id PK
+        TEXT conversation_id FK
+        TEXT message_id FK
+        INTEGER source_id
+        INTEGER chunk_id
+        TEXT title
+        TEXT url
+        TEXT snippet
+        TEXT evidence_id
+        TEXT original_created_at
+        TEXT original_research_turn
+        INTEGER reused
+        TEXT created_at
+    }
+    conversation_summaries {
+        TEXT conversation_id PK
+        TEXT summary
+        TEXT summarized_through_message_id
+        TEXT updated_at
+    }
+    conversation_summary_failures {
+        TEXT conversation_id PK
+        TEXT failed_at
+    }
+```
+
+---
+
+## Research Pipeline
+
+VeriScope executes the following stages during a web research turn:
+
+1. **Query Reception & Serialization:** `POST /api/search` (or `POST /api/conversations/:conversationId/messages`) validates inputs and queues the request via `runSerializedResearch` so concurrent requests do not contend for local GPU/VRAM resources.
+2. **Entity Resolution & Routing:** `entityResolution.js` and `researchRouting.js` resolve follow-up pronouns (e.g., *"he"*, *"that position"*) against completed exchanges and route the turn to `LOCAL`, `REUSE`, `WEB`, or `HYBRID`.
+3. **Context Budgeting & Rolling Summaries:** `conversationContext.js` and `contextBudget.js` update a compact SQLite summary once completed messages pass `OLLAMA_SUMMARY_THRESHOLD_MESSAGES` (default `16`) and fit recent exchanges within `OLLAMA_CONTEXT_LENGTH` (`4096`) while reserving `OLLAMA_MIN_OUTPUT_TOKENS` (`696`) and a safety margin (`256`).
+4. **Search Discovery & URL Filtering:** `searchEngine.js` queries SearXNG (`/search?format=json`), fetches up to 12 raw results, validates every URL against private/loopback IP ranges (`urlSafety.js`), strips tracking parameters (`utm_*`, `fbclid`, `gclid`, etc.), and keeps up to **5 unique URLs**.
+5. **Web Extraction & Text Cleaning:** `scraper.js` fetches pages in parallel (concurrency limit `3`, max `6,000` characters per page) using Axios + Cheerio, stripping scripts, navigation, footers, ads, and cookie banners. If a page is blocked or unreadable, it falls back to the SearXNG search snippet. *(Playwright headless Chromium fallback is implemented in `scraper.js` and currently disabled by default in `research.js` to control latency.)*
+6. **Chunking & Near-Duplicate Suppression:** `chunker.js` splits page text into `1,000`-character chunks with `200`-character overlap. `deduplicateChunks` removes exact duplicates and near-duplicates (Jaccard similarity $\ge 0.70$ or containment $\ge 0.85$).
+7. **BM25 Lexical Retrieval:** `bm25.js` builds a per-query `wink-bm25-text-search` index (with a term-frequency fallback when fewer than 3 chunks exist) and selects the top **20** candidates.
+8. **MiniLM Semantic Retrieval:** `embeddings.js` sends the query and top 20 candidate chunks to the local FastAPI `all-MiniLM-L6-v2` service and computes cosine similarity (`semanticsearch.js`). If the embedding service is offline, the pipeline logs a warning and degrades gracefully to BM25-only scoring.
+9. **Hybrid Scoring:** Both BM25 and cosine similarity scores are min-max normalized to $[0, 1]$ (`normalize.js`) and combined using the user-configurable $\alpha$ parameter:
+
+$$\text{Score} = \alpha \times \text{normalized\_BM25} + (1 - \alpha) \times \text{normalized\_semantic}$$
+
+   - **$\alpha$ Control:** Users adjust $\alpha \in [0.1, 0.9]$ (default `0.5`) directly from the composer popover. Higher $\alpha$ prioritizes exact keyword matches (BM25); lower $\alpha$ prioritizes conceptual similarity (MiniLM).
+   - *Note:* Normalized hybrid scores reflect relative ranking among retrieved chunks for a given query, not factual probability or confidence.
+10. **Source Diversification & Token Budgeting:** `diversifySources` caps passages at **2 chunks per URL**, and `selectEvidenceWithinBudget` trims evidence to fit the selected depth preset (`FAST`: 5 chunks / 2,000 tokens; `NORMAL`: 10 chunks / 4,000 tokens; `MAX`: 20 chunks / 5,000 tokens) and remaining prompt budget.
+11. **Evidence Sufficiency Gate:** `evidenceJudge.js` prompts the local model at `temperature: 0.0` to evaluate *only* the retrieved passages and return strict JSON (`sufficient`, `reason`, `missing`). If evidence is insufficient or the evaluator times out/returns malformed JSON, VeriScope **fails closed** and does not hallucinate an answer.
+12. **Grounded Generation & Citation Validation:** `ollama.js` streams the grounded answer via SSE with strict `[Source N]` citation rules. `validateAndSanitizeCitations` strips any citation IDs that do not exist in the supplied evidence package.
+13. **Claim-to-Evidence Attribution:** `evidenceAttribution.js` maps individual factual claims in the answer to exact contiguous quotes in the retrieved chunks (`direct`, `partial`, `related`, or `unsupported`), verifying every quote verbatim against the stored chunk text.
+
+---
+
+## Technology Stack
+
+| Layer | Technology | Purpose | Role in VeriScope |
+| :--- | :--- | :--- | :--- |
+| **Frontend** | React 19, Vite 8 | UI & Build Tooling | Interactive research workspace, SSE token streaming, theme management, and responsive sidebar. |
+| **Markdown** | `react-markdown`, `remark-gfm`, `rehype-highlight` | Safe Rendering | Renders GFM tables/code blocks without raw HTML execution; custom `remarkCitations` plugin turns `[Source N]` into clickable chips. |
+| **Backend** | Node.js 22 (ESM), Express 5 | REST & SSE API | Orchestrates routing, scraping, retrieval, LLM calls, SSE streaming, and security headers. |
+| **Local LLM** | Ollama (`qwen3.5:9b`) | Inference Engine | Runs per-turn routing, evidence sufficiency gating, grounded answer synthesis, claim attribution, and conversation summarization. |
+| **Web Search** | SearXNG + Valkey 9 | Metasearch & Cache | Self-hosted web URL discovery via JSON API with persistent Valkey state. |
+| **Scraping** | Axios, Cheerio, Playwright | Content Extraction | Fast static HTML extraction with SSRF protection (`urlSafety.js`) and optional headless browser fallback. |
+| **Embeddings** | Python 3.11, FastAPI, `sentence-transformers` | Semantic Search | Local microservice running `all-MiniLM-L6-v2` on CPU (`POST /embed`). |
+| **Lexical Search** | `wink-bm25-text-search` | Keyword Retrieval | In-memory BM25 scoring over extracted page chunks. |
+| **Database** | SQLite (`node:sqlite`) | Local Persistence | WAL-mode relational storage for conversations, messages, evidence references, research runs, and summaries. |
+| **Infrastructure** | Docker Compose, Nginx | Containerization | Orchestrates frontend (Nginx proxy), backend, SearXNG, Valkey, MiniLM, and Linux Ollama bridge. |
+
+---
+
+## Project Structure
+
+```text
+VeriScope/
+├── backend/
+│   ├── embedding-service/          # FastAPI + all-MiniLM-L6-v2 microservice
+│   │   ├── app.py                  # / and /embed endpoints
+│   │   ├── Dockerfile
+│   │   └── requirements.txt
+│   ├── src/
+│   │   ├── llm/
+│   │   │   ├── contextBudget.js        # Prompt/output token budget enforcement
+│   │   │   ├── conversationContext.js  # Rolling summaries & history selection
+│   │   │   ├── entityResolution.js     # Pronoun & entity resolution for follow-ups
+│   │   │   ├── evidenceAttribution.js  # Verbatim claim-to-chunk quote mapping
+│   │   │   ├── evidenceJudge.js        # Fail-closed evidence sufficiency evaluator
+│   │   │   ├── ollama.js               # Grounded generation, direct answers & citation sanitization
+│   │   │   ├── ollamaClient.js         # Env config, timeouts & error classification
+│   │   │   ├── ollamaHealth.js         # Non-intrusive /api/tags & service health checks
+│   │   │   └── researchRouting.js      # Deterministic + LLM per-turn query router
+│   │   ├── retrieval/
+│   │   │   ├── bm25.js                 # wink-bm25-text-search wrapper + small-corpus fallback
+│   │   │   ├── chunker.js              # Overlapping text chunker
+│   │   │   ├── deduplicate.js          # URL normalization, Jaccard chunk dedup & source diversity
+│   │   │   ├── depth.js                # FAST/NORMAL/MAX presets & token estimation
+│   │   │   ├── embeddings.js           # MiniLM client with BM25 fallback detection
+│   │   │   ├── evidence.js             # Evidence package builder
+│   │   │   ├── normalize.js            # Min-max score normalization
+│   │   │   └── semanticsearch.js       # Cosine similarity
+│   │   ├── routes/
+│   │   │   └── search.js               # /api/search & /api/conversations/:id/messages (JSON/SSE)
+│   │   ├── scraper/
+│   │   │   ├── scraper.js              # Axios + Cheerio, Playwright & snippet fallback
+│   │   │   ├── searchEngine.js         # SearXNG JSON discovery client
+│   │   │   └── urlSafety.js            # SSRF protection (blocks private/loopback IPv4 & IPv6)
+│   │   ├── conversationStore.js        # SQLite schema & transactional CRUD
+│   │   ├── monitoring.js               # Ollama /api/ps, nvidia-smi & host RAM metrics
+│   │   ├── ollamaBridge.js             # Linux Docker-bridge-only proxy to 127.0.0.1:11434
+│   │   ├── research.js                 # Main end-to-end research pipeline orchestrator
+│   │   └── server.js                   # Express app, security headers, CORS & routes
+│   ├── test/                           # Node.js built-in test runner unit & API tests
+│   ├── Dockerfile
+│   └── package.json
+├── frontend/
+│   ├── public/favicon.svg              # VeriScope SVG mark
+│   ├── src/
+│   │   ├── components/                 # Composer, Sidebar, Message, Evidence, Markdown, StatusLine
+│   │   ├── hooks/                      # useHealth, useTheme, usePersistentState, useMediaQuery
+│   │   ├── lib/                        # citations.js, evidence.js, research.js, stream.js, format.js
+│   │   ├── App.jsx                     # Main application shell & SSE stream state
+│   │   └── conversationApi.js          # Backend API client
+│   ├── Dockerfile
+│   ├── nginx.conf                      # Reverse proxy for /api/ -> backend:5001
+│   └── package.json
+├── searxng/
+│   └── settings.yml                    # SearXNG HTML + JSON format configuration
+├── .env.example                        # Safe environment variable template
+├── compose.yaml                        # Core Docker Compose stack
+└── compose.linux.yaml                  # Linux override adding loopback-safe ollama-bridge
+```
+
+---
+
+## Installation and Setup
+
+### Prerequisites
+
+- **Docker Engine / Docker Desktop** (with Docker Compose v2)
+- **Ollama** installed natively on the host machine (deliberately not containerized to preserve direct GPU/Metal acceleration)
+- **Node.js 22+** and **Python 3.11+** *(required only for native/manual development; not needed for Docker Compose)*
+
+### 1. Clone the Repository
+
+```bash
+git clone [https://github.com/adeebkhan14/VeriScope-A-Local-First-Evidence-Grounded-Deep-Research-System.git](https://github.com/adeebkhan14/VeriScope-A-Local-First-Evidence-Grounded-Deep-Research-System.git)
+cd VeriScope-A-Local-First-Evidence-Grounded-Deep-Research-System
+```
+
+### 2. Install Ollama and Pull the Default Model
+
+Install Ollama from [ollama.com](https://ollama.com), then pull `qwen3.5:9b`:
+
+```bash
+ollama pull qwen3.5:9b
+ollama list
+```
+
+### 3. Configure Environment Variables
+
+Copy `.env.example` to `.env` and generate a unique `SEARXNG_SECRET`:
+
+**Linux / macOS:**
+```bash
 cp .env.example .env
-sed -i "s/^SEARXNG_SECRET=.*/SEARXNG_SECRET=$(openssl rand -hex 32)/" .env
-docker compose up -d --build searxng embedding
+sed -i.bak "s/^SEARXNG_SECRET=.*/SEARXNG_SECRET=$(openssl rand -hex 32)/" .env && rm -f .env.bak
 ```
 
-In one terminal, install and start the backend:
+**Windows (PowerShell):**
+```powershell
+Copy-Item .env.example .env
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$secret = ($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
+(Get-Content .env) -replace '^SEARXNG_SECRET=.*', "SEARXNG_SECRET=$secret" | Set-Content .env
+```
 
-```sh
+### 4. Start VeriScope with Docker Compose (Recommended)
+
+**macOS / Windows (Docker Desktop):**
+```bash
+docker compose up --build -d
+```
+
+**Linux (with loopback-preserving Ollama bridge):**
+```bash
+docker compose -f compose.yaml -f compose.linux.yaml up --build -d
+```
+
+> **Note:** On the first run, the `embedding` container downloads `all-MiniLM-L6-v2` weights and may take a few minutes to become healthy. The SQLite database (`backend/data/veriscope.db`) is initialized automatically on backend startup.
+
+Open **http://localhost:5173** in your browser.
+
+### 5. Native / Manual Development Setup
+
+If you prefer running the frontend and backend natively while keeping SearXNG and MiniLM in Docker:
+
+```bash
+# 1. Start SearXNG (with Valkey) and MiniLM in Docker
+docker compose up -d --build searxng embedding
+
+# 2. Terminal 1 — Start Backend (Node.js 22+)
 cd backend
 npm ci
-node --env-file=../.env src/server.js
-```
+npm run dev
 
-In another terminal, install and start the frontend:
-
-```sh
+# 3. Terminal 2 — Start Frontend
 cd frontend
 npm ci
 npm run dev
 ```
 
-Open **http://localhost:5173**. Keep Ollama running on the host. The
-embedding image downloads the MiniLM model on its first start and may
-take a few minutes. To stop the containerized services, run
-`docker compose down` from the project root.
-
-For a Docker-only launch, verify Docker Desktop is running:
-
-```text
-docker --version
-docker compose version
-docker info
-```
-
-# 2. Project structure
-
-The repository contains the React frontend, Express backend, FastAPI
-embedding service, Compose definition, and project-managed SearXNG
-settings. SearXNG's cache and Valkey state are stored in named Docker
-volumes.
-
-# 3. Install Docker Desktop
-
-Install Docker Desktop for macOS or Windows from the official Docker
-website. On Windows, use the WSL 2 backend if Docker Desktop offers the
-choice.
-
-After installation, open Docker Desktop and wait until Docker is
-running.
-
-------------------------------------------------------------------------
-
-# 4. Configure SearXNG and local environment
-
-SearXNG is used by VeriScope for web search/discovery.
-
-It is NOT the final retrieval system. It gives VeriScope URLs that can
-then be scraped and processed locally.
-
-Copy the sample environment file once.
-
-macOS:
-
-```sh
-cp .env.example .env
-openssl rand -hex 32
-```
-
-Windows PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-$bytes = New-Object byte[] 32
-$rng.GetBytes($bytes)
-($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
-```
-
-Put the generated value in `.env` as `SEARXNG_SECRET`. Keep `.env`
-private; it is ignored by Git. The checked-in
-[`searxng/settings.yml`](./searxng/settings.yml) preserves the existing
-default SearXNG settings and JSON search format. The secret is supplied at
-runtime, not stored in the settings file or image.
-
-The previous separate SearXNG project is not modified or removed by this
-migration. VeriScope now has its own managed SearXNG configuration and
-persistent cache/Valkey volumes. If the old service is still using port
-8080, either stop it yourself when convenient or change `SEARXNG_PORT` in
-`.env` (for example, to `8081`). For native backend development, also set
-`SEARXNG_URL=http://localhost:8081` in `.env`. Compose backend traffic
-continues to use the internal `searxng:8080` address. The old project
-remains available independently.
-
-------------------------------------------------------------------------
-
-# 5. Install Ollama
-
-Ollama runs the local language model used by VeriScope.
-
-Install Ollama for macOS or Windows from the official Ollama download
-page. Keep Ollama running on the host; it is deliberately not
-containerized.
-
-After installation, check:
-
-``` bash
-ollama --version
-```
-
-Check installed models:
-
-``` bash
-ollama list
-```
-
-------------------------------------------------------------------------
-
-# 6. Install Qwen 3.5 9B
-
-VeriScope uses the `qwen3.5:9b` model by default. You can override the
-model with the `OLLAMA_MODEL` environment variable.
-
-Download/run it:
-
-``` bash
-ollama run qwen3.5:9b
-```
-
-The first run downloads the model. Verify it is installed:
-
-``` bash
-ollama list
-```
-
-------------------------------------------------------------------------
-
-# 7. Ollama connectivity
-
-Native backend development uses `http://localhost:11434`. A containerized
-backend uses `http://host.docker.internal:11434`. Compose maps that name to
-the host gateway.
-
-On Linux, a host Ollama service bound only to `127.0.0.1` is reachable by a
-native backend but not by a container through the Docker gateway. Keep the
-native URL as `http://localhost:11434`. For Compose, use
-`http://host.docker.internal:11434`. The Linux Compose override provides a
-small bridge-only proxy that listens on the Docker host-gateway address and
-forwards to `127.0.0.1:11434`; the Ollama service stays loopback-only. The
-proxy refuses to bind unless the address belongs to a Docker bridge interface.
-It does not change firewall rules or expose Ollama to a LAN/public interface.
-
-------------------------------------------------------------------------
-
-# 8. Native/manual development prerequisites
-
-The Compose startup does not require local Node.js or Python. For the
-native workflow, install project dependencies once:
-
-```sh
-cd backend
-npm ci
-cd ../frontend
-npm ci
-```
-
-------------------------------------------------------------------------
-
-# 9. Setup the Local MiniLM Embedding Service
-
-For manual development, start MiniLM in its own terminal. From the
-repository root on macOS:
-
-```sh
+*(Optional)* To run the MiniLM embedding service natively without Docker:
+```bash
 python3 -m venv backend/embedding-service/venv
-source backend/embedding-service/venv/bin/activate
+source backend/embedding-service/venv/bin/activate   # Windows: .\backend\embedding-service\venv\Scripts\Activate.ps1
 pip install -r backend/embedding-service/requirements.txt
 cd backend/embedding-service
 uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
-On Windows PowerShell:
+### 6. Run Backend Tests
 
-```powershell
-py -3 -m venv backend\embedding-service\venv
-.\backend\embedding-service\venv\Scripts\Activate.ps1
-python -m pip install -r backend\embedding-service\requirements.txt
-Set-Location backend\embedding-service
-python -m uvicorn app:app --host 127.0.0.1 --port 8000
-```
-
-------------------------------------------------------------------------
-
-# 10. Start the VeriScope Backend
-
-Start Ollama and MiniLM, then start the Compose-managed SearXNG service
-from the repository root with `docker compose up -d searxng`. Keep `.env`
-in the repository root, then start the backend from `backend/` so Node loads the native
-service URLs from that file:
-
-```sh
-cd backend
-node --env-file=../.env src/server.js
-```
-
-Without `.env`, native defaults use SearXNG at `http://localhost:8080`,
-Ollama at `http://localhost:11434`, and MiniLM at
-`http://127.0.0.1:8000`.
-
-------------------------------------------------------------------------
-
-# 11. Test the Backend Research API
-
-You can test the complete research pipeline without React.
-
-From another terminal on macOS:
-
-```sh
-curl -X POST http://localhost:5001/api/search \
-  -H "Content-Type: application/json" \
-  -d '{"query":"How does Kubernetes perform service discovery?"}'
-```
-
-On Windows PowerShell:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri http://localhost:5001/api/search -ContentType 'application/json' -Body '{"query":"How does Kubernetes perform service discovery?"}'
-```
-
-The `query` field must be a non-empty string. `forceWebSearch`, when
-provided, must be a boolean. Invalid fields and malformed JSON return a
-JSON `400` response with a message describing the problem.
-
-If SearXNG is unavailable, the API returns `503`; invalid or failed
-upstream responses return `502`. Unexpected server errors return `500`
-with a generic client-safe message. Individual page scrape failures do
-not stop the rest of the search: available snippets and successfully
-scraped pages are used, and recovery details are returned in `warnings`.
-
-Backend JSON requests are limited to 1 MB. Set `CORS_ORIGINS` to a
-comma-separated allowlist when browser requests should be restricted to
-specific frontend origins, for example:
-
-```sh
-CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-```
-
-Without `CORS_ORIGINS`, CORS remains permissive for local development.
-Each response includes an `X-Request-ID` header for request tracing.
-
-Run the focused backend test suite from the backend directory:
-
-```sh
+```bash
 cd backend
 npm test
 ```
 
-The pipeline should execute:
+---
 
-``` text
-Query
- ↓
-SearXNG
- ↓
-Web URLs
- ↓
-Axios/Cheerio
- ↓
-Playwright fallback if required
- ↓
-Chunks
- ↓
-BM25
- ↓
-MiniLM embeddings
- ↓
-Hybrid retrieval
- ↓
-Evidence package
- ↓
-Qwen 3.5 9B
- ↓
-Answer + citations
+## Configuration
+
+All environment variables are loaded from the root `.env` file (via `node --env-file-if-exists=../.env` or Docker Compose).
+
+| Variable | Purpose | Required | Default |
+| :--- | :--- | :---: | :--- |
+| `SEARXNG_SECRET` | Secret key required by the SearXNG container | **Yes** | *(none — must be generated)* |
+| `PORT` | Express backend HTTP port | No | `5001` |
+| `CORS_ORIGINS` | Comma-separated allowed frontend origins | No | Permissive in native dev; `http://localhost:5173,http://127.0.0.1:5173` in Compose |
+| `OLLAMA_BASE_URL` / `OLLAMA_URL` | Ollama API base URL (`OLLAMA_URL` is a legacy alias) | No | `http://localhost:11434` (native) / `http://host.docker.internal:11434` (container) |
+| `OLLAMA_MODEL` | Local Ollama model name | No | `qwen3.5:9b` |
+| `OLLAMA_KEEP_ALIVE` | Duration Ollama keeps the model loaded in memory | No | `30m` |
+| `OLLAMA_CONTEXT_LENGTH` | Total context window (`num_ctx`) | No | `4096` |
+| `OLLAMA_NUM_PREDICT` | Maximum generated output tokens (`num_predict`) | No | `2048` |
+| `OLLAMA_TEMPERATURE` | Sampling temperature (`0`–`2`) | No | `0.3` (native) / `0.15` (Compose) |
+| `OLLAMA_REQUEST_TIMEOUT_MS` | Timeout for Ollama inference calls (ms) | No | `300000` |
+| `OLLAMA_HISTORY_TOKEN_BUDGET` | Max tokens allocated to conversation history | No | `1600` |
+| `OLLAMA_RECENT_EXCHANGES` | Number of recent Q&A pairs retained verbatim | No | `5` |
+| `OLLAMA_SUMMARY_THRESHOLD_MESSAGES` | Message count before rolling summarization activates | No | `16` |
+| `OLLAMA_SUMMARY_MIN_NEW_MESSAGES` | Minimum new older messages to trigger summary update | No | `6` |
+| `OLLAMA_SUMMARY_TOKEN_BUDGET` | Max token budget for stored conversation summary | No | `500` |
+| `OLLAMA_HISTORICAL_EVIDENCE_TOKEN_BUDGET` | Max tokens for historical evidence excerpts | No | `300` |
+| `OLLAMA_MIN_OUTPUT_TOKENS` | Minimum output tokens reserved before truncating prompt | No | `696` |
+| `OLLAMA_CONTEXT_SAFETY_MARGIN` | Safety buffer subtracted from `OLLAMA_CONTEXT_LENGTH` | No | `256` |
+| `SEARXNG_URL` / `DOCKER_SEARXNG_URL` | SearXNG base URL (native / container) | No | `http://localhost:8080` / `http://searxng:8080` |
+| `SEARXNG_HOST_BIND` / `SEARXNG_PORT` | Host bind interface and port for SearXNG | No | `127.0.0.1` / `8080` |
+| `EMBEDDING_URL` / `DOCKER_EMBEDDING_URL` | MiniLM `/embed` endpoint (native / container) | No | `http://127.0.0.1:8000/embed` / `http://embedding:8000/embed` |
+| `EVIDENCE_JUDGE_TIMEOUT_MS` | Timeout for the evidence sufficiency gate (ms) | No | `60000` (native) / `180000` (Compose) |
+| `CLAIM_ATTRIBUTION_TIMEOUT_MS` | Timeout for claim-to-evidence attribution (ms) | No | `15000` |
+| `RESEARCH_{FAST,NORMAL,MAX}_TOP_K` | Max evidence chunks per depth preset | No | `5` / `10` / `20` |
+| `RESEARCH_{FAST,NORMAL,MAX}_EVIDENCE_TOKEN_BUDGET` | Evidence token budget per depth preset | No | `2000` / `4000` / `5000` |
+| `VERISCOPE_DEBUG_CONTEXT` | Log prompt token allocation diagnostics (non-prod) | No | `false` |
+
+---
+
+## API Documentation
+
+The Express backend exposes REST and Server-Sent Events (SSE) endpoints on port `5001` (proxied at `/api/*` by Vite in dev and Nginx in Docker). Request bodies are capped at `1 MB`.
+
+| Method | Endpoint | Purpose |
+| :--- | :--- | :--- |
+| `GET` | `/` | Basic API liveness check (`{ name, status }`). |
+| `GET` | `/api/health` | Checks connectivity to Ollama (`/api/tags`), SearXNG, and MiniLM without loading the model. |
+| `GET` | `/api/monitoring` | Returns Ollama model allocation (`/api/ps`), NVIDIA GPU metrics (`nvidia-smi`), host RAM, and last research metrics. |
+| `POST` | `/api/search` | Starts a research query (creates a conversation automatically if `sessionId` is omitted). Supports JSON or SSE. |
+| `GET` | `/api/conversations` | Lists all conversations ordered by `updated_at DESC` with message counts. |
+| `POST` | `/api/conversations` | Creates a new conversation (optionally accepting `title` or an initial `message`). |
+| `GET` | `/api/conversations/:conversationId` | Returns a conversation with its ordered `messages`, `evidenceReferences`, and `researchRuns`. |
+| `DELETE` | `/api/conversations/:conversationId` | Deletes a conversation and cascades to messages, evidence, and summaries. |
+| `POST` | `/api/conversations/:conversationId/messages` | Sends a follow-up query within an existing conversation. Supports JSON or SSE. |
+
+<details>
+<summary><strong>Example Requests, Responses & Error Codes</strong></summary>
+
+#### `POST /api/search` (JSON)
+```bash
+curl -X POST http://localhost:5001/api/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How does Kubernetes perform service discovery?",
+    "depth": "NORMAL",
+    "alpha": 0.5,
+    "forceWebSearch": false
+  }'
 ```
 
-------------------------------------------------------------------------
+**Request Body Parameters:**
+- `query` *(string, required)*: Non-empty research question (also accepts `content` or `message`).
+- `depth` *(string, optional)*: `"FAST"`, `"NORMAL"` (default), or `"MAX"`.
+- `alpha` *(number, optional)*: Hybrid weight between `0` and `1` (default `0.5`).
+- `forceWebSearch` *(boolean, optional)*: Bypass local routing and always search the web (default `false`).
+- `sessionId` *(string, optional)*: Existing or client-generated conversation ID (max 128 chars).
+- `stream` *(boolean, optional)*: Set `true` or send `Accept: text/event-stream` for SSE streaming.
 
-# 12. Start React
+**SSE Events (`Accept: text/event-stream`):**
+- `event: status` → `{"message": "Scraping 5 pages..."}`
+- `event: token` → `{"text": "Kubernetes uses..."}`
+- `event: done` → `{"result": { "query", "answer", "citations", "evidence", "claimAttribution", "insufficientEvidence", "source", "researchMetadata", "conversationId", "userMessageId", "assistantMessageId" }}`
+- `event: error` → `{"error": "...", "code": "...", "service": "..."}`
 
-In another terminal:
+**Error Responses:**
+- `400 Bad Request`: Missing/empty query, invalid `depth`, out-of-range `alpha`, or malformed JSON.
+- `404 Not Found`: Unknown `:conversationId`.
+- `413 Payload Too Large`: Request body > 1 MB or prompt exceeds safe `OLLAMA_CONTEXT_LENGTH` (`CONTEXT_BUDGET_EXCEEDED`).
+- `502 Bad Gateway`: Upstream SearXNG or Ollama returned an invalid/failed response.
+- `503 Service Unavailable`: SearXNG or Ollama is unreachable.
+- `504 Gateway Timeout`: Upstream search or inference timed out.
 
-```sh
-cd frontend
-npm run dev
-```
+</details>
 
-React should normally be available at:
+---
 
-``` text
-http://localhost:5173
-```
+## Security and Privacy
 
-Open that address in your browser.
+VeriScope is designed to keep inference and storage local while being transparent about external network boundaries:
 
-------------------------------------------------------------------------
+- **What Stays Local:**
+  - All LLM inference (routing, evidence judging, answer synthesis, claim attribution, summarization) runs locally via Ollama.
+  - Semantic embeddings (`all-MiniLM-L6-v2`) and BM25 indexing run locally.
+  - Conversations, messages, and evidence excerpts are stored locally in `backend/data/veriscope.db` (unencrypted SQLite on disk).
+  - The frontend renders Markdown without `rehype-raw` and suppresses remote images so model output cannot execute HTML or trigger third-party image requests.
+- **What Communicates Externally:**
+  - When a query routes to `WEB` or `HYBRID`, SearXNG sends the resolved search query to configured external search engines.
+  - The backend scraper issues direct HTTP/HTTPS GET requests to discovered public web pages.
+- **Built-In Protections:**
+  - **SSRF Defense (`urlSafety.js`):** Blocks non-HTTP(S) schemes, URLs with embedded credentials, and DNS/IP resolutions pointing to loopback, private, link-local, or multicast IPv4/IPv6 ranges.
+  - **HTTP Hardening (`server.js`):** Sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, disables `X-Powered-By`, attaches `X-Request-ID`, and supports `CORS_ORIGINS` allowlisting.
+  - **Linux Bridge Isolation (`ollamaBridge.js`):** Refuses to bind unless the resolved IPv4 address belongs to a Docker bridge interface (`docker0` / `br-*`), keeping host Ollama on `127.0.0.1`.
 
-# 13. Run VeriScope with Docker Compose
+---
 
-After completing section 4 and setting `SEARXNG_SECRET`, start the Compose
-stack. On Linux, use the additional file to enable the loopback-preserving
-Ollama bridge:
+## Performance and Evaluation
+
+No formal benchmark results are checked into this repository yet. End-to-end latency varies significantly with local hardware (GPU VRAM vs. CPU/unified memory offload), `OLLAMA_CONTEXT_LENGTH`, and target website response times. You can inspect live hardware allocation and the latest run's timing (`retrievalTimeMs`, `timeToFirstTokenMs`, `generationTimeMs`) via `GET /api/monitoring`.
+
+### Evaluation Roadmap
+
+Proposed metrics for a future reproducible evaluation suite:
+
+- **Retrieval Quality:** Precision@K and Recall@K across BM25-only, MiniLM-only, and hybrid $\alpha$ configurations.
+- **Citation Accuracy:** Rate of valid, verifiable `[Source N]` citations vs. stripped/hallucinated markers.
+- **Answer Faithfulness:** Claim-level verification rate (`direct` / `partial` vs. `unsupported` claims from `evidenceAttribution.js`).
+- **Evidence Sufficiency Accuracy:** False-positive and false-negative rates of `evidenceJudge.js` on unanswerable and multi-part queries.
+- **Query Routing Accuracy:** Classification precision across `LOCAL`, `REUSE`, `WEB`, `HYBRID`, and `ambiguous` turns.
+- **Latency & Resource Consumption:** Per-stage timing breakdown (SearXNG, scraping, embedding, judging, TTFT, generation) alongside VRAM/RAM usage.
+
+---
+
+## Screenshots and Demonstration
+
+No screenshots or demo recordings are currently included in the repository.
+
+To add visual assets, create a `docs/screenshots/` directory and link them using relative paths:
 
 ```text
-docker compose -f compose.yaml -f compose.linux.yaml up --build -d
+docs/
+└── screenshots/
+    ├── workspace-dark.png      # Main research interface with inline citation chips
+    ├── evidence-drawer.png     # Expanded evidence cards with hybrid relevance scores
+    └── composer-controls.png   # Depth presets, alpha slider, and Web: auto/always toggle
 ```
 
-On Docker Desktop, use the standard Compose file:
+---
 
-```text
-docker compose up --build -d
-```
+## Roadmap
 
-Open **http://localhost:5173**. The backend API is available at
-**http://localhost:5001**. Ollama and Qwen 3.5 9B remain native host services.
-The backend waits for healthy SearXNG and MiniLM services before starting.
+### Completed
+- [x] Local-first Docker Compose stack (React/Nginx, Express, SearXNG, Valkey, FastAPI MiniLM) + Linux loopback-safe Ollama bridge
+- [x] Hybrid BM25 + `all-MiniLM-L6-v2` retrieval with configurable $\alpha$ and graceful BM25 fallback
+- [x] Research depth presets (`FAST`, `NORMAL`, `MAX`) with token-budgeted evidence selection
+- [x] Fail-closed evidence sufficiency gate (`evidenceJudge.js`)
+- [x] Citation sanitization (`validateAndSanitizeCitations`) and verbatim claim-to-evidence attribution (`evidenceAttribution.js`)
+- [x] Per-turn query routing, pronoun/entity resolution, and SQLite conversation persistence with rolling summaries
+- [x] SSE streaming frontend with clickable citation chips, collapsible evidence cards, and live health status
 
-| Service | Host address | Notes |
-| --- | --- | --- |
-| Frontend | `http://localhost:5173` | React/Vite app served by the frontend container |
-| Backend | `http://localhost:5001` | Express API |
-| SearXNG | `http://localhost:8080` | Host port configurable with `SEARXNG_PORT`; internal address is `searxng:8080` |
-| MiniLM | `embedding:8000` | Compose-only; native development uses `http://127.0.0.1:8000` |
-| Ollama | `http://localhost:11434` | Native host service; Linux Compose reaches it through the bridge-only proxy |
-| Valkey | `valkey:6379` | Internal SearXNG state; not published to the host |
+### Planned
+- [ ] Contradiction detection across conflicting web sources
+- [ ] Local document research (PDF, Markdown, and text ingestion)
+- [ ] Encrypted SQLite conversation storage
+- [ ] Research report export (Markdown / PDF)
+- [ ] Automated evaluation suite and stage-by-stage latency benchmarks
+- [ ] Embedding cache to avoid recomputing unchanged webpage chunks
 
-------------------------------------------------------------------------
+---
 
-# 14. Quick Health Checks
+## Contributing and License
 
-Before searching, check:
+### Contributing
 
-### Docker
+Contributions, bug reports, and architecture improvements are welcome.
 
-``` bash
-docker ps
-```
+1. Fork the repository and create a feature branch (`git checkout -b feat/your-feature`).
+2. Run the backend test suite (`cd backend && npm test`) and frontend linter (`cd frontend && npm run lint`) before submitting.
+3. Open a Pull Request describing the problem, your changes, and how you verified them.
 
-### SearXNG
+For bug reports, please include your OS, Docker/Node versions, `OLLAMA_MODEL`, and the output of `GET /api/health` (with any sensitive values removed).
 
-macOS:
+### License
 
-```sh
-curl "http://localhost:8080/search?q=test&format=json"
-```
-
-Windows PowerShell:
-
-```powershell
-Invoke-RestMethod "http://localhost:8080/search?q=test&format=json"
-```
-
-### Ollama
-
-macOS:
-
-```sh
-curl http://localhost:11434/api/tags
-```
-
-Windows PowerShell:
-
-```powershell
-Invoke-RestMethod http://localhost:11434/api/tags
-```
-
-Test actual model generation (not just connectivity):
-
-```sh
-curl http://localhost:11434/api/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.5:9b","prompt":"Reply with exactly QWEN_OK","stream":false,"think":false,"options":{"num_predict":64,"temperature":0}}'
-```
-
-### Qwen 3.5 9B
-
-``` bash
-ollama list
-```
-
-### MiniLM
-
-``` bash
-docker compose exec backend node -e "fetch('http://embedding:8000/').then(async r => { console.log(await r.text()); process.exit(r.ok ? 0 : 1); })"
-```
-
-Check the backend's Compose-network connections to its dependencies:
-
-```sh
-docker compose exec backend node -e "fetch('http://searxng:8080/search?q=test&format=json').then(r => { console.log('SearXNG HTTP ' + r.status); process.exit(r.ok ? 0 : 1); })"
-docker compose exec backend node -e "fetch('http://embedding:8000/').then(async r => { console.log(await r.text()); process.exit(r.ok ? 0 : 1); })"
-docker compose exec backend node -e "fetch('http://host.docker.internal:11434/api/tags').then(r => { console.log('Ollama HTTP ' + r.status); process.exit(r.ok ? 0 : 1); })"
-```
-
-The `/api/health` endpoint reports connectivity status for all three
-upstream services, the configured model name, and whether it is installed.
-Ollama health uses `/api/tags` only; it does not load the model or generate
-text during frontend polling.
-
-Check Ollama's GPU offload and NVIDIA utilization:
-
-```sh
-ollama ps
-nvidia-smi
-```
-
-`ollama ps` reports the CPU/GPU split. A 9B model may use both system RAM and
-VRAM depending on available memory; do not infer full GPU residency from the
-GPU model alone.
-
-### Backend
-
-macOS:
-
-```sh
-curl http://localhost:5001/
-```
-
-Windows PowerShell:
-
-```powershell
-Invoke-RestMethod http://localhost:5001/
-```
-
-### React
-
-Open:
-
-``` text
-http://localhost:5173
-```
-
-------------------------------------------------------------------------
-
-# 15. Stopping Services
-
-Stop the Compose stack while preserving named data volumes:
-
-```text
-docker compose down
-```
-
-This does not stop native Ollama. The previous separate SearXNG project
-is untouched.
-
-------------------------------------------------------------------------
-
-## Troubleshooting: macOS
-
-- If `docker info` cannot connect, open Docker Desktop and wait for its
-  engine to finish starting. `docker compose ps` should show healthy
-  services after startup.
-- Check host ports with `lsof -nP -iTCP:8080 -sTCP:LISTEN` and the same
-  command for `5173`, `5001`, and `11434`. If another local SearXNG owns
-  8080, change `SEARXNG_PORT` in `.env`; Compose-to-Compose traffic still
-  uses `searxng:8080`.
-- Test host Ollama with `curl http://localhost:11434/api/tags`. If that
-  works but the container check fails, see the host-listener and firewall
-  instructions in section 7.
-- Inspect service startup with `docker compose ps` and
-  `docker compose logs searxng valkey backend embedding`.
-
-## Troubleshooting: Windows
-
-- Start Docker Desktop and confirm its WSL 2 backend is running before
-  using `docker compose`. In PowerShell, `docker info` must show server
-  details.
-- Check port conflicts with
-  `Get-NetTCPConnection -State Listen -LocalPort 8080,5173,5001,11434`.
-  Change `SEARXNG_PORT` in `.env` if local port 8080 is occupied.
-- Test host Ollama with
-  `Invoke-RestMethod http://localhost:11434/api/tags`. If Compose cannot
-  reach it, confirm Windows Defender Firewall permits local Docker
-  Desktop traffic to port 11434; do not create a public inbound rule.
-- From the backend container, run the `host.docker.internal` check in
-  section 14. For SearXNG and MiniLM use their Compose service names;
-  `localhost` inside a container refers to that container itself.
-- Use `docker compose logs searxng valkey backend embedding` to inspect
-  startup failures. The first MiniLM start downloads model weights and
-  may take several minutes.
-
-# 16. Important: Why Does Research Take \~3 Minutes?
-
-A 3-minute end-to-end response on an M2 MacBook Air does NOT necessarily
-mean Qwen alone takes 3 minutes.
-
-VeriScope currently performs many sequential operations:
-
-``` text
-1. Search SearXNG
-       ↓
-2. Scrape several webpages
-       ↓
-3. Possibly launch Playwright
-       ↓
-4. Chunk all webpages
-       ↓
-5. Generate embeddings for every chunk
-       ↓
-6. Generate query embedding
-       ↓
-7. Calculate BM25 scores
-       ↓
-8. Calculate semantic scores
-       ↓
-9. Normalize scores
-       ↓
-10. Calculate hybrid scores
-       ↓
-11. Select evidence
-       ↓
-12. Send evidence to Qwen
-       ↓
-13. Generate final answer
-```
-
-Several of these are currently performed sequentially.
-
-The Playwright fallback can also be relatively expensive because the
-current scraper opens a browser for each fallback page.
-
-Therefore, before optimizing Qwen, measure where the time is actually
-being spent.
-
-------------------------------------------------------------------------
-
-# 17. Will It Be Faster on Another Computer?
-
-Yes.
-
-Local LLM performance depends heavily on the hardware.
-
-Local Qwen performance depends on your hardware; a machine with a
-significantly faster GPU and/or more memory can generate responses much
-faster.
-
-The biggest differences usually come from:
-
--   GPU performance
--   available VRAM/unified memory
--   memory bandwidth
--   CPU performance
--   model size
--   quantization
--   prompt/context size
--   number of generated tokens
-
-A modern NVIDIA GPU machine can be substantially faster for local LLM
-inference than an older M2 Air.
-
-A newer Apple Silicon Mac can also improve performance. Ollama has
-continued improving its Apple Silicon backend, including MLX-based
-optimizations.
-
-However, **your 3-minute total time is not a good measurement of
-Qwen's raw generation speed** because the VeriScope pipeline includes
-web searching, scraping, embedding, retrieval, and then generation.
-
-------------------------------------------------------------------------
-
-# 18. How We Should Optimize VeriScope Later
-
-Do NOT optimize everything at once.
-
-First measure each stage.
-
-The ideal next improvement is to add timing:
-
-``` text
-SearXNG:          2.1s
-Scraping:        18.5s
-Chunking:         0.2s
-BM25:             0.1s
-Embeddings:      35.2s
-Hybrid retrieval: 0.1s
-Qwen:             95.4s
------------------------
-Total:           151.6s
-```
-
-Then we know exactly what is slow.
-
-Likely future optimizations include:
-
-### Scraping
-
-Instead of opening Playwright for every difficult page:
-
-``` text
-Axios/Cheerio
-      ↓
-Is content sufficient?
-      ↓
-Yes → continue
-No  → Playwright
-```
-
-This is already the basic strategy in the current implementation.
-
-### Embeddings
-
-Later we can:
-
--   cache embeddings
--   avoid embedding duplicate content
--   batch requests
--   avoid recomputing unchanged webpages
-
-### Retrieval
-
-We can improve:
-
--   chunk size
--   overlap
--   BM25 weighting
--   semantic weighting
--   duplicate removal
--   source ranking
-
-### Qwen
-
-We can measure:
-
--   time to first token
--   tokens/second
--   prompt size
--   output length
-
-We can also test another local model later and compare it against
-Qwen rather than changing the architecture immediately.
-
-------------------------------------------------------------------------
-
-# 19. Important Project Principle
-
-VeriScope is designed so that Qwen is NOT the search engine and NOT
-the source of truth.
-
-The flow is:
-
-``` text
-Internet
-   ↓
-SearXNG
-   ↓
-Web pages
-   ↓
-Local extraction
-   ↓
-Local retrieval
-   ↓
-Evidence
-   ↓
-Qwen
-   ↓
-Grounded answer
-```
-
-Qwen should synthesize the evidence supplied by VeriScope rather than
-independently inventing the research.
-
-This is important for the project's evidence-grounding and citation
-goals.
-
-------------------------------------------------------------------------
-
-# 20. Useful Commands Cheat Sheet
-
-### Compose stack (all app services and SearXNG)
-
-``` bash
-docker compose up --build
-docker compose down
-```
-
-For native/manual development, start only the Compose-managed search
-services with `docker compose up -d searxng`.
-
-To check persistence across a restart, use `docker compose down`, then
-`docker compose up --build` and repeat the search test. Do not use
-`docker compose down -v` unless you intend to delete named state volumes.
-
-### Ollama
-
-``` bash
-ollama list
-ollama run qwen3.5:9b
-ollama serve
-```
-
-### MiniLM
-
-``` bash
-docker compose exec backend node -e "fetch('http://embedding:8000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
-```
-
-### Backend
-
-``` bash
-cd backend
-node --env-file=../.env src/server.js
-```
-
-### React
-
-``` bash
-cd frontend
-npm run dev
-```
-
-For the complete API research test, use the macOS or PowerShell command
-in section 11.
-
-------------------------------------------------------------------------
-
-# 21. Official Documentation
-
-For installation details and updates, use the official documentation
-for:
-
--   Docker Desktop for macOS and Windows
--   SearXNG container installation
--   Ollama
--   Ollama Qwen 3.5 9B model
-
-The commands in this README are intended for the current VeriScope
-development setup and may need minor adjustments when dependencies or
-upstream services change.
-
-------------------------------------------------------------------------
-
-# 22. Local Ollama, context, and retrieval tuning
-
-The backend reads `OLLAMA_BASE_URL`, `OLLAMA_MODEL`,
-`OLLAMA_KEEP_ALIVE`, `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_NUM_PREDICT`,
-`OLLAMA_TEMPERATURE`, `OLLAMA_REQUEST_TIMEOUT_MS`, and the `OLLAMA_*`
-context-management values in the root `.env`. `OLLAMA_URL` remains
-supported as a legacy alias for `OLLAMA_BASE_URL`. The Compose default
-for `OLLAMA_CONTEXT_LENGTH` is 4096; it is not raised automatically.
-Requests preserve the configured model, temperature, and keep-alive and
-set Ollama's `num_ctx`, `num_predict`, and `stream` fields.
-
-The initial context is 4096 tokens, the maximum generation setting is
-2048 tokens, the minimum output reserve is 696 tokens, and a 256-token
-safety margin is held back. The request's `num_predict` is reduced when
-the estimated prompt needs more room. Research reduces its evidence
-budget before omitting the current question or core instructions. FAST,
-NORMAL, and MAX default to Top-K/token budgets of 5/2000, 10/4000, and
-20/5000. These values can be changed in `.env` using
-`RESEARCH_{FAST,NORMAL,MAX}_TOP_K` and
-`RESEARCH_{FAST,NORMAL,MAX}_EVIDENCE_TOKEN_BUDGET`. BM25/MiniLM alpha
-is independent of depth: 0.3 is semantic-heavy, 0.5 balanced, and 0.7
-keyword-heavy. The browser remembers depth/alpha and completed research
-results locally in IndexedDB; conversation messages are persisted by the
-backend in SQLite.
-
-Context selection keeps up to five recent complete exchanges within
-`OLLAMA_HISTORY_TOKEN_BUDGET` (1600 tokens by default), in chronological
-order. Failed or incomplete exchanges are omitted. Older completed turns
-are summarized with the configured local Ollama model when the history
-exceeds `OLLAMA_SUMMARY_THRESHOLD_MESSAGES` (16 messages by default).
-Summaries update incrementally after at least
-`OLLAMA_SUMMARY_MIN_NEW_MESSAGES` (6) new older messages; they are stored
-in SQLite and never replace original messages. Failed summary attempts
-fall back to bounded recent context and are retried after
-`OLLAMA_SUMMARY_RETRY_INTERVAL_MS`.
-
-Stored excerpts added to ordinary conversation context retain their
-original source/chunk IDs but are explicitly marked as unverified
-continuity context. For factual follow-ups, deterministic routing can
-select the original passages saved with one earlier research answer;
-those passages keep their original IDs and must pass the same
-evidence-sufficiency gate and citation verification as newly retrieved
-evidence. If they are insufficient, the existing SearXNG retrieval
-pipeline runs. A stored summary or assistant answer is never authoritative
-evidence.
-
-Simple rephrasing and clarification requests use conversation context
-without web search. Queries that explicitly request current information or
-fresh verification go directly to web research. Leadership and employment
-status changes, market prices/metrics, and software version or availability
-questions also require fresh research. Stable explanations, programming
-questions, and ordinary conversation use local knowledge. Ambiguous
-references with no conversation antecedent receive a clarification prompt.
-Only unresolved requests use a non-streaming local route classifier. The
-route is finalized before answer generation starts; local answers and
-evidence-backed answers cannot switch modes after their first token.
-
-No model tokenizer dependency is used. Token counts are conservative
-estimates based on text characters plus per-message overhead, with a
-safety margin; they are not exact Qwen token counts, especially for code,
-URLs, and non-English text. The 4096 context setting should be benchmarked
-on the target hardware before changing it. `keep_alive=30m` keeps model
-weights and runner state loaded between requests; it does not retain a
-conversation.
-
-In development, set `VERISCOPE_DEBUG_CONTEXT=true` for counts-only
-diagnostics: conversation ID, available/selected messages, summary use,
-estimated prompt/evidence tokens, `num_ctx`, output limit, and truncation.
-It is disabled by default and never logs message contents. The existing
-streaming research endpoint and SSE event names remain unchanged.
-
-## Optional native Linux systemd tuning
-
-Ollama is a separate native service; backend `.env` values do not change
-the systemd service. The following is an operator procedure, not an
-automatic project install. First inspect the effective service with
-`systemctl cat ollama.service`. Then use a systemd drop-in instead of
-editing or replacing the unit:
-
-```sh
-sudo install -d -m 0755 /etc/systemd/system/ollama.service.d
-sudo tee /etc/systemd/system/ollama.service.d/90-veriscope.conf >/dev/null <<'EOF'
-[Service]
-Environment="OLLAMA_FLASH_ATTENTION=1"
-Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
-Environment="OLLAMA_KEEP_ALIVE=30m"
-Environment="OLLAMA_NUM_PARALLEL=1"
-Environment="OLLAMA_MAX_LOADED_MODELS=1"
-Environment="OLLAMA_CONTEXT_LENGTH=4096"
-EOF
-```
-
-This adds a separate drop-in and does not replace the unit or its existing
-environment. Review the resulting configuration before reloading and
-restarting only the Ollama service:
-
-```sh
-systemctl cat ollama.service
-sudo systemctl daemon-reload
-sudo systemctl restart ollama.service
-```
-
-Verify the service environment and GPU allocation:
-
-```sh
-systemctl show ollama.service -p DropInPaths --value
-systemctl show ollama.service -p Environment --value |
-  tr ' ' '\n' |
-  grep -E '^OLLAMA_(FLASH_ATTENTION|KV_CACHE_TYPE|KEEP_ALIVE|NUM_PARALLEL|MAX_LOADED_MODELS|CONTEXT_LENGTH)='
-ollama ps
-nvidia-smi
-```
-
-The API's `num_ctx` request option is the application-level context
-setting; the service's `OLLAMA_CONTEXT_LENGTH` supplies the server
-default. Do not set `num_gpu` or a fixed GPU-layer count. Ollama chooses
-offload placement based on available VRAM. `ollama ps` reports the
-actual CPU/GPU split after a model is loaded. The dashboard's GPU and
-model-allocation measurements are on-demand; unavailable measurements
-remain explicitly unavailable.
-
-Flash Attention enables Ollama's quantized K/V cache. `q8_0` uses
-approximately half the memory of the default `f16` cache with little
-quality impact in typical use; `q4_0` uses less memory but can cause more
-noticeable quality loss. KV quantization is a server-wide setting.
-Reducing cache precision trades a small amount of numerical fidelity for
-more context headroom; it does not shrink model weights or guarantee the
-whole model fits in 8 GiB VRAM. With 16 GiB system RAM, leave placement
-automatic and observe actual GPU/CPU allocation.
-
-To roll back only this drop-in (the inspected unit currently has no
-existing drop-ins), remove its file and restart Ollama:
-
-```sh
-sudo rm /etc/systemd/system/ollama.service.d/90-veriscope.conf
-sudo systemctl daemon-reload
-sudo systemctl restart ollama.service
-```
-
-Do not run the rollback command if you have since added other settings to
-that drop-in; review `systemctl cat ollama.service` first. The rollback
-leaves the original unit and all other drop-ins untouched.
-
-## Monitoring and model comparison
-
-`GET /api/monitoring` gathers Ollama `/api/tags` and `/api/ps`, a
-single `nvidia-smi` snapshot, host CPU memory, and the last request's
-retrieval/generation timing. The UI refreshes this only when requested.
-Ollama does not expose a KV cache quantization field in these monitoring
-responses, so verify `OLLAMA_KV_CACHE_TYPE` in the effective service
-environment and check Ollama logs during an inference; do not infer cache
-precision from model allocation.
-
-No replacement model is selected automatically. A smaller text-only
-Qwen candidate should be compared against the installed Qwen 3.5 9B on
-the same evidence-grounded research prompts, context, quantization, and
-hardware, with citation correctness and answer quality checked alongside
-TTFT, generation time, and VRAM/RAM. A model file being smaller or
-text-only is not by itself evidence of a meaningful research-quality
-advantage. Models are never downloaded or removed by VeriScope.
+No `LICENSE` file is currently present in the repository root *(the `backend/package.json` metadata lists `ISC`, while no root project license has been formally specified)*. Please add a `LICENSE` file to define redistribution and usage terms.
